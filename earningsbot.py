@@ -157,6 +157,8 @@ while True:
             earnings_publisher = EarningsPublisher(message)
             earnings_publisher.send_message()
 
+            logging.info(earnings_publisher.title)
+
             # Store this message for next time.
             last_message_id = message["id"]
 
