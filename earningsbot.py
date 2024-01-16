@@ -136,7 +136,8 @@ logging.info("Starting up...")
 while True:
     # Don't run on weekends.
     if datetime.today().weekday() > 4:
-        sleep(300)
+        logging.info("Skipping run due to weekend.")
+        sleep(3600)
         continue
 
     # Get a list of messages on StockTwits.
@@ -145,10 +146,12 @@ while True:
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0"
     }
     params = {"filter": "all", "limit": 21}
+    logging.info("Getting latest messages...")
     resp = requests.get(URL, params=params, headers=headers)
 
     # Skip reporting if this is the first time we've run since a restart.
     if last_message_id == 0 and FORCED_MESSAGES == 0:
+        logging.info("Not reporting on first run.")
         last_message_id = resp.json()["messages"][0]["id"]
 
     # Loop over the messages and report on each that hasn't been seen previously.
@@ -160,6 +163,7 @@ while True:
             # Store this message for next time.
             last_message_id = message["id"]
 
+    logging.info("Waiting 5 minutes before next run...")
     sleep(300)
 
 # Print a message to Discord noting that we shut down.
