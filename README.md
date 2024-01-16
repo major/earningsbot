@@ -1,0 +1,1 @@
+Just a silly bot to send stock earnings to a Discord channel. 😉
