@@ -14,6 +14,9 @@ from discord_webhook import DiscordEmbed, DiscordWebhook
 # ?thread_id=1234567890 to the end of the URL.
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
+# Allow messages to be forced on the first run after a restart.
+FORCED_MESSAGES = os.environ.get("FORCED_MESSAGES", 0)
+
 # Store the ID of the last message we saw.
 last_message_id = 0
 
@@ -140,7 +143,7 @@ while True:
     resp = requests.get(URL, params=params, headers=headers)
 
     # Skip reporting if this is the first time we've run since a restart.
-    if last_message_id == 0:
+    if last_message_id == 0 and FORCED_MESSAGES == 0:
         last_message_id = resp.json()["messages"][0]["id"]
         continue
 
