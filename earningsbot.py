@@ -125,7 +125,6 @@ class EarningsPublisher(object):
         )
         embed.set_image("https://major.io/transparent.png")
         embed.set_thumbnail(url=self.logo)
-        embed.set_timestamp()
         webhook.add_embed(embed)
         return webhook.execute()
 
