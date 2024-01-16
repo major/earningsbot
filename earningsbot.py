@@ -5,6 +5,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from time import sleep
 
 import requests
@@ -133,6 +134,11 @@ class EarningsPublisher(object):
 logging.info("Starting up...")
 
 while True:
+    # Don't run on weekends.
+    if datetime.today().weekday() > 4:
+        sleep(300)
+        continue
+
     # Get a list of messages on StockTwits.
     URL = "https://api.stocktwits.com/api/2/streams/user/epsguid.json"
     headers = {
@@ -144,7 +150,6 @@ while True:
     # Skip reporting if this is the first time we've run since a restart.
     if last_message_id == 0 and FORCED_MESSAGES == 0:
         last_message_id = resp.json()["messages"][0]["id"]
-        continue
 
     # Loop over the messages and report on each that hasn't been seen previously.
     for message in reversed(resp.json()["messages"]):
