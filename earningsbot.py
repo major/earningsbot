@@ -130,9 +130,6 @@ class EarningsPublisher(object):
         return webhook.execute()
 
 
-# Print a message to Discord noting that we started up.
-logging.info("Starting up...")
-
 while True:
     # Don't run on weekends.
     if datetime.today().weekday() > 4:
@@ -165,6 +162,3 @@ while True:
 
     logging.info("Waiting 5 minutes before next run...")
     sleep(300)
-
-# Print a message to Discord noting that we shut down.
-logging.info("Shutting down...")
