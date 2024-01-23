@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """Send earnings reports to Discord."""
+import functools
 import logging
 import os
 import re
@@ -35,48 +36,61 @@ class EarningsPublisher(object):
 
     message: dict
 
-    @property
-    def consensus(self):
-        """Get consensus for the earnings."""
+    @functools.cached_property
+    def body(self) -> str:
+        """Get the message body."""
+        return self.message.get("body", "")
+
+    @functools.cached_property
+    def _consensus(self) -> str | None:
+        """Get consensus for the earnings as a string."""
         regex = r"consensus was (\(?\$[0-9\.]+\)?)"
-        result = re.findall(regex, self.message["body"])
+        result = re.findall(regex, self.body)
 
         # Some earnings reports for smaller stocks don't have a consensus.
         if not result:
             return None
 
         # Parse the consensus and handle negative numbers.
-        raw_consensus = result[0]
-        if "(" in raw_consensus:
+        consensus = re.findall(r"[0-9\.]+", result[0])[0]
+        if "(" in result[0]:
             # We have an expected loss.
-            consensus = float(re.findall(r"[0-9\.]+", raw_consensus)[0]) * -1
-        else:
-            # We have an expected gain.
-            consensus = float(re.findall(r"[0-9\.]+", raw_consensus)[0])
+            return f"-${consensus}"
 
+        # We have an expected gain.
         return consensus
 
     @property
-    def earnings(self):
-        """Get earnings or loss data."""
+    def consensus(self) -> float | None:
+        """Get consensus for the earnings."""
+        return float(self._consensus) if self._consensus else None
+
+    @functools.cached_property
+    def _earnings(self) -> str | None:
+        """Get earnings or loss data as a string."""
         # Look for positive earnings by default.
         regex = r"reported (?:earnings of )?\$([0-9\.]+)"
 
         # Sometimes there's a loss. 😞
-        if "reported a loss of" in self.message["body"]:
+        if "reported a loss of" in self.body:
             regex = r"reported a loss of \$([0-9\.]+)"
 
-        result = re.findall(regex, self.message["body"])
+        result = re.findall(regex, self.body)
 
         if result:
-            return float(result[0])
+            return result[0]
 
         return None
 
     @property
-    def ticker(self):
+    def earnings(self) -> float | None:
+        """Get earnings or loss data."""
+        return float(self._earnings) if self._earnings else None
+
+    @functools.cached_property
+    def ticker(self) -> str | None:
         """Extract ticker from the tweet text."""
-        result = re.findall(r"^\$([A-Z]+)", self.message["body"])
+        result = re.findall(r"^\$([A-Z]+)", self.body)
 
         if result:
             return result[0].upper()
@@ -84,35 +98,37 @@ class EarningsPublisher(object):
         return None
 
     @property
-    def winner(self):
+    def winner(self) -> bool | None:
         """Return an emoji based on the earnings outcome."""
         if not self.consensus:
             return None
-        elif self.earnings < self.consensus:
-            return False
-        else:
+
+        if self.earnings > self.consensus:
             return True
 
+        return False
+
     @property
-    def color(self):
+    def color(self) -> str:
         """Return a color for the Discord message."""
         if self.winner is None:
             return "aaaaaa"
-        elif self.winner:
+
+        if self.winner:
             return "008000"
-        else:
-            return "d42020"
+
+        return "d42020"
 
     @property
-    def logo(self):
+    def logo(self) -> str:
         """Return a URL for the company logo."""
         url_base = "https://s3.amazonaws.com/logos.atom.finance/stocks-and-funds"
         return f"{url_base}/{self.ticker}.png"
 
     @property
-    def title(self):
+    def title(self) -> str:
         """Generate a title for the Discord message."""
-        return f"{self.ticker}: ${self.earnings} vs. ${self.consensus} expected"
+        return f"{self.ticker}: ${self._earnings} vs. ${self._consensus} expected"
 
     def send_message(self):
         """Publish a Discord message based on the earnings report."""
