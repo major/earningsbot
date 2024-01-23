@@ -155,7 +155,8 @@ while True:
     for message in reversed(resp.json()["messages"]):
         if message["id"] > last_message_id:
             earnings_publisher = EarningsPublisher(message)
-            earnings_publisher.send_message()
+            if earnings_publisher.earnings:
+                earnings_publisher.send_message()
 
             logging.info(earnings_publisher.title)
 
