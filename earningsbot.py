@@ -121,11 +121,13 @@ class EarningsPublisher(object):
         )
         embed = DiscordEmbed(
             title=self.title,
-            description=self.message["symbols"][0]["title"],
             color=self.color,
         )
-        embed.set_image("https://major.io/transparent.png")
-        embed.set_thumbnail(url=self.logo)
+        embed.set_author(
+            name=self.message["symbols"][0]["title"],
+            url=f"https://finance.yahoo.com/quote/{self.ticker}/",
+            icon_url=self.logo,
+        )
         webhook.add_embed(embed)
         return webhook.execute()
 
