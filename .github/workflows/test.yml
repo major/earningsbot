@@ -16,5 +16,5 @@ jobs:
 
       - name: Run tests
         run: |
-          docker built -t testimage .
+          docker build -t testimage .
           docker run --volume $(pwd):/app testimage python test.py
