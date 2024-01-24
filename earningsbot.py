@@ -165,19 +165,12 @@ def generate_messages(last_message_id: int = 0) -> int:
     logging.info("Getting latest messages...")
     resp = requests.get(URL, params=params, headers=headers)
 
-    # Skip reporting if this is the first time we've run since a restart.
-    if last_message_id == 0 and FORCED_MESSAGES == 0:
-        logging.info("Not reporting on first run.")
-        last_message_id = resp.json()["messages"][0]["id"]
-
-    # Loop over the messages and report on each that hasn't been seen previously.
-    for message in reversed(resp.json()["messages"]):
-        if message["id"] > last_message_id:
-            yield message
+    for message in resp.json()["messages"]:
+        yield message
 
 
 if __name__ == "__main__":
-    last_message_id = 0
+    last_message_id = FORCED_MESSAGES
 
     while True:
         if working_for_the_weekend():
@@ -187,6 +180,16 @@ if __name__ == "__main__":
             continue
 
         for message in generate_messages(last_message_id):
+            # Skip reporting if this is the first time we've run since a restart.
+            if last_message_id == 0:
+                logging.info("Not reporting on first run.")
+                last_message_id = message["id"]
+
+                break
+
+            if message["id"] <= last_message_id:
+                continue
+
             earnings_publisher = EarningsPublisher(message)
 
             if earnings_publisher.earnings:
