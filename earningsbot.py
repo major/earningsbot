@@ -19,9 +19,6 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 # Allow messages to be forced on the first run after a restart.
 FORCED_MESSAGES = os.environ.get("FORCED_MESSAGES", 0)
 
-# Store the ID of the last message we saw.
-last_message_id = 0
-
 # Set up logging.
 logging.basicConfig(
     stream=sys.stdout,
@@ -44,20 +41,20 @@ class EarningsPublisher(object):
     @functools.cached_property
     def _consensus(self) -> str | None:
         """Get consensus for the earnings as a string."""
-        regex = r"consensus was (\(?\$[0-9\.]+\)?)"
-        result = re.findall(regex, self.body)
+        # Regex to match consensus earnings, including those wrapped in parentheses for losses.
+        regex = r"consensus was \(*\$?([0-9.]+)\)*"
+        result = re.search(regex, self.body)
 
         # Some earnings reports for smaller stocks don't have a consensus.
         if not result:
             return None
 
-        # Parse the consensus and handle negative numbers.
-        consensus = re.findall(r"[0-9\.]+", result[0])[0]
-        if "(" in result[0]:
-            # We have an expected loss.
-            return f"-${consensus}"
+        consensus = result.group(1)
 
-        # We have an expected gain.
+        # Check if the original string had parentheses, indicating a loss.
+        if "(" in result.group(0):
+            return f"-{consensus}"
+
         return consensus
 
     @property
@@ -68,17 +65,18 @@ class EarningsPublisher(object):
     @functools.cached_property
     def _earnings(self) -> str | None:
         """Get earnings or loss data as a string."""
-        # Look for positive earnings by default.
-        regex = r"reported (?:earnings of )?\$([0-9\.]+)"
+        # Combined regex for earnings and losses.
+        regex = r"reported (?:earnings of )?\$([0-9\.]+)|(?:a loss of )?\$([0-9\.]+)"
 
-        # Sometimes there's a loss. 😞
-        if "reported a loss of" in self.body:
-            regex = r"reported a loss of \$([0-9\.]+)"
-
-        result = re.findall(regex, self.body)
+        result = re.search(regex, self.body)
 
         if result:
-            return result[0]
+            # Check which group was matched to determine if it's a loss or gain.
+            earnings, loss = result.groups()
+            if loss:
+                return f"-{loss}"
+            elif earnings:
+                return earnings
 
         return None
 
@@ -148,19 +146,22 @@ class EarningsPublisher(object):
         return webhook.execute()
 
 
-while True:
-    # Don't run on weekends.
-    if datetime.today().weekday() > 4:
-        logging.info("Skipping run due to weekend.")
-        sleep(3600)
-        continue
+def working_for_the_weekend(today: datetime = datetime.today()) -> bool:
+    """Don't run on weekends."""
+    if today.weekday() > 4:
+        return True
 
-    # Get a list of messages on StockTwits.
+    return False
+
+
+def generate_messages(last_message_id: int = 0) -> int:
+    """Returns a generator that yields messages from StockTwits."""
     URL = "https://api.stocktwits.com/api/2/streams/user/epsguid.json"
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0"
     }
     params = {"filter": "all", "limit": 21}
+
     logging.info("Getting latest messages...")
     resp = requests.get(URL, params=params, headers=headers)
 
@@ -172,7 +173,22 @@ while True:
     # Loop over the messages and report on each that hasn't been seen previously.
     for message in reversed(resp.json()["messages"]):
         if message["id"] > last_message_id:
+            yield message
+
+
+if __name__ == "__main__":
+    last_message_id = 0
+
+    while True:
+        if working_for_the_weekend():
+            logging.info("Skipping run due to weekend.")
+            # Sleep for an hour and try again.
+            sleep(3600)
+            continue
+
+        for message in generate_messages(last_message_id):
             earnings_publisher = EarningsPublisher(message)
+
             if earnings_publisher.earnings:
                 earnings_publisher.send_message()
 
@@ -181,5 +197,6 @@ while True:
             # Store this message for next time.
             last_message_id = message["id"]
 
-    logging.info("Waiting 5 minutes before next run...")
-    sleep(300)
+        # Sleep for 5 minutes before checking for new messages.
+        logging.info("Waiting 5 minutes before next run...")
+        sleep(300)
