@@ -15,3 +15,46 @@ newsbot = "newsbot:main"
 [build-system]
 requires = ["uv_build>=0.13.8,<0.14.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.6",
+    "ty>=0.0.107",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+strict_markers = true
+strict_config = true
+addopts = ["--cov=newsbot", "--cov-branch", "--cov-report=term-missing"]
+
+[tool.coverage.run]
+branch = true
+source = ["newsbot"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 100
+
+[tool.ruff]
+line-length = 88
+target-version = "py315"
+
+[tool.ruff.lint]
+select = ["ALL"]
+# D203 conflicts with D211 and D213 conflicts with D212; keep the D211 and D212 styles.
+# COM812 conflicts with the ruff formatter, as ruff warns on every run.
+# CPY001: per-file copyright headers are not wanted; license is tracked at the repo level.
+ignore = ["D203", "D213", "COM812", "CPY001"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use plain assert statements.
+"tests/**" = ["S101"]
+
+[tool.ty.environment]
+python-version = "3.15"
