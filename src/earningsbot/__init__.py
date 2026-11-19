@@ -4,21 +4,31 @@ import argparse
 import os
 import sys
 import time
-from contextlib import closing
+from contextlib import ExitStack, closing
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import httpx2
 from edgar import get_current_filings, set_identity
+from edgar.reference.tickers import find_ticker
 
+from earningsbot.discord import notify_discord
 from earningsbot.edgar import format_filing, poll
 from earningsbot.state import SeenStore
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from earningsbot.edgar import Filing
 
 IDENTITY_ENV = "EDGAR_IDENTITY"
 STATE_ENV = "EARNINGSBOT_STATE_PATH"
+WEBHOOKS_ENV = "DISCORD_EARNINGS_WEBHOOKS"
+STOCK_LOGO_ENV = "STOCK_LOGO"
+TRANSPARENT_PNG_ENV = "TRANSPARENT_PNG"
 DEFAULT_STATE_PATH = ".earningsbot/seen.sqlite3"
+DEFAULT_STOCK_LOGO = "https://static.stocktitan.net/company-logo/%s.webp"
+DEFAULT_TRANSPARENT_PNG = "https://major.io/transparent.png"
 USAGE_EXIT_CODE = 2
 
 
@@ -38,6 +48,41 @@ def _state_path() -> Path:
     """Return the seen-store path from the environment, or the default when blank."""
     # 🗂️ A blank value counts as unset, so an empty variable never picks the cwd.
     return Path(os.environ.get(STATE_ENV, "").strip() or DEFAULT_STATE_PATH)
+
+
+def _setting(name: str, default: str) -> str:
+    """Return a setting from the environment, or the default when unset or blank."""
+    return os.environ.get(name, "").strip() or default
+
+
+def _webhook_urls(raw: str) -> list[str]:
+    """Split a comma-separated webhook list, dropping blank entries."""
+    stripped = (item.strip() for item in raw.split(","))
+    return [url for url in stripped if url]
+
+
+def _discord_notifier(
+    client: httpx2.Client,
+    webhooks: list[str],
+) -> Callable[[Filing], None]:
+    """Return a notifier that prints each filing, then posts it to Discord."""
+    stock_logo = _setting(STOCK_LOGO_ENV, DEFAULT_STOCK_LOGO)
+    transparent_png = _setting(TRANSPARENT_PNG_ENV, DEFAULT_TRANSPARENT_PNG)
+
+    def notify(filing: Filing) -> None:
+        """Print the filing line, then post it to every Discord webhook."""
+        _notify(filing)
+        # 🔎 Looked up at call time, so tests can patch find_ticker in this module.
+        notify_discord(
+            filing,
+            client=client,
+            webhooks=webhooks,
+            stock_logo=stock_logo,
+            transparent_png=transparent_png,
+            lookup_ticker=find_ticker,
+        )
+
+    return notify
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -64,10 +109,17 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(USAGE_EXIT_CODE)
 
     set_identity(identity)
-    with closing(SeenStore(_state_path())) as seen:
+    webhooks = _webhook_urls(os.environ.get(WEBHOOKS_ENV, ""))
+    with ExitStack() as stack:
+        seen = stack.enter_context(closing(SeenStore(_state_path())))
+        notify: Callable[[Filing], None] = _notify
+        if webhooks:
+            # 🌐 One client serves the whole run, and the stack closes it on any exit.
+            client = stack.enter_context(closing(httpx2.Client()))
+            notify = _discord_notifier(client, webhooks)
         succeeded = poll(
             fetch=lambda: get_current_filings(form="8-K", page_size=100),
-            notify=_notify,
+            notify=notify,
             warn=lambda message: sys.stderr.write(message + "\n"),
             sleep=time.sleep,
             seen=seen,

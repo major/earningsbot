@@ -1,20 +1,26 @@
 """Tests for the earningsbot command line entry point."""
 
+import functools
+import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+import httpx2
 import pytest
 
 import earningsbot
 from earningsbot import main
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 IDENTITY_ENV = "EDGAR_IDENTITY"
 STATE_ENV = "EARNINGSBOT_STATE_PATH"
+WEBHOOKS_ENV = "DISCORD_EARNINGS_WEBHOOKS"
 USAGE_EXIT_CODE = 2
 FAILED_CYCLE_EXIT_CODE = 1
+RETRY_POST_COUNT = 2
 EXPECTED_LINE = (
     "2026-11-18  Acme Corp  CIK 320193  0001-26-000001  "
     "https://www.sec.gov/index.html\n"
@@ -27,6 +33,12 @@ def state_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     path = tmp_path / "state" / "seen.sqlite3"
     monkeypatch.setenv(STATE_ENV, str(path))
     return path
+
+
+@pytest.fixture(autouse=True)
+def no_discord_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """🧪 Clear the webhook variable so no test can post to Discord."""
+    monkeypatch.delenv(WEBHOOKS_ENV, raising=False)
 
 
 @pytest.fixture
@@ -149,3 +161,70 @@ def test_main_once_exits_1_when_cycle_fails(
 
     assert exc_info.value.code == FAILED_CYCLE_EXIT_CODE
     assert "feed down" in capsys.readouterr().err
+
+
+def _patch_discord(
+    monkeypatch: pytest.MonkeyPatch,
+    statuses: Iterator[int],
+) -> list[httpx2.Request]:
+    """🧪 Send Discord posts to a mock transport that answers with each status."""
+    posts: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        """🧪 Record each post and answer with the next status."""
+        posts.append(request)
+        return httpx2.Response(next(statuses))
+
+    # 🧪 The partial is built before setattr, so it wraps the real Client class.
+    transport = httpx2.MockTransport(handler)
+    monkeypatch.setattr(
+        httpx2,
+        "Client",
+        functools.partial(httpx2.Client, transport=transport),
+    )
+    monkeypatch.setattr(earningsbot, "find_ticker", lambda _cik: "ACME")
+    return posts
+
+
+@pytest.mark.usefixtures("identities", "feed")
+def test_main_posts_to_discord_when_webhooks_set(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Each configured webhook gets one post, and the stdout line is still printed."""
+    # Arrange
+    monkeypatch.setenv(WEBHOOKS_ENV, " https://a/x , ,https://b/y ")
+    posts = _patch_discord(monkeypatch, iter([204, 204]))
+
+    # Act
+    main(["--once"])
+
+    # Assert
+    assert [str(post.url) for post in posts] == ["https://a/x", "https://b/y"]
+    assert json.loads(posts[0].content)["embeds"][0]["title"] == "ACME: Acme Corp"
+    assert capsys.readouterr().out == EXPECTED_LINE
+
+
+@pytest.mark.usefixtures("identities", "feed")
+def test_main_discord_failure_retries_next_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failed post warns and exits 1, and the next run posts the same filing again."""
+    # Arrange
+    monkeypatch.setenv(WEBHOOKS_ENV, "https://a/x")
+    posts = _patch_discord(monkeypatch, iter([500, 204]))
+
+    # Act
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--once"])
+    first = capsys.readouterr()
+    main(["--once"])
+    second = capsys.readouterr()
+
+    # Assert
+    assert exc_info.value.code == FAILED_CYCLE_EXIT_CODE
+    assert "unexpected status 500" in first.err
+    assert len(posts) == RETRY_POST_COUNT
+    assert second.out == EXPECTED_LINE
+    assert second.err == ""

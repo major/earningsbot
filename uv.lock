@@ -104,6 +104,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "edgartools" },
+    { name = "httpx2" },
 ]
 
 [package.dev-dependencies]
@@ -115,7 +116,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "edgartools", specifier = ">=6.3.0" }]
+requires-dist = [
+    { name = "edgartools", specifier = ">=6.3.0" },
+    { name = "httpx2", specifier = ">=2.16.2" },
+]
 
 [package.metadata.requires-dev]
 dev = [
