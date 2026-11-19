@@ -12,6 +12,17 @@ if TYPE_CHECKING:
 EARNINGS_ITEM = "2.02"
 
 
+class SeenFilings(Protocol):
+    """🗃️ What this module needs from a seen collection. A set or SeenStore fits."""
+
+    # 🧩 Positional-only, because set.__contains__ takes its key that way.
+    def __contains__(self, accession_no: object, /) -> bool:
+        """Return True when the accession number was already handled."""
+
+    def add(self, accession_no: str, /) -> None:
+        """Record the accession number as handled."""
+
+
 class EightKReport(Protocol):
     """🧩 The part of an edgartools EightK report this module reads."""
 
@@ -54,7 +65,7 @@ def is_earnings(items: list[str]) -> bool:
 
 def new_earnings_filings(
     filings: Iterable[Filing],
-    seen: set[str],
+    seen: SeenFilings,
     get_items: Callable[[Filing], list[str]] = lambda f: f.obj().items,
 ) -> Iterator[Filing]:
     """Yield unseen filings that report Item 2.02, in feed order.
@@ -87,27 +98,28 @@ def format_filing(filing: Filing) -> str:
 
 def poll(  # noqa: PLR0913 - the spec fixes these injected dependencies as keywords
     fetch: Callable[[], Iterable[Filing]],
-    write: Callable[[str], object],
+    notify: Callable[[Filing], object],
     warn: Callable[[str], object],
     sleep: Callable[[float], object],
     *,
+    seen: SeenFilings,
     interval: float,
     once: bool,
 ) -> bool:
-    """Print new earnings filings until stopped, or for one cycle when ``once``.
+    """Notify about new earnings filings until stopped, or for one cycle when ``once``.
 
-    The ``seen`` set lives for the whole call, so a filing is printed once.
-    A failed cycle calls ``warn`` and polling continues. Returns True when the
-    single cycle in ``once`` mode succeeded, and False when it warned. The
-    loop never returns otherwise. Dependencies are injected so tests need no
-    network and no real sleeping.
+    ``notify`` gets each new earnings filing once. The caller owns ``seen``, so
+    a filing already recorded there, even by an earlier run, is not notified
+    again. A failed cycle calls ``warn`` and polling continues. Returns True
+    when the single cycle in ``once`` mode succeeded, and False when it warned.
+    The loop never returns otherwise. Dependencies are injected so tests need
+    no network and no real sleeping.
     """
-    seen: set[str] = set()
     while True:
         succeeded = True
         try:
             for filing in new_earnings_filings(fetch(), seen):
-                write(format_filing(filing) + "\n")
+                notify(filing)
         except Exception as err:  # noqa: BLE001 - one bad cycle must not stop the poller
             warn(f"poll cycle failed: {err!r}")
             succeeded = False

@@ -104,42 +104,47 @@ def test_format_filing() -> None:
     assert format_filing(filing) == EXPECTED_LINE
 
 
-def test_poll_once_writes_new_earnings() -> None:
-    """One cycle writes only the earnings filings, never sleeps, and reports success."""
+def test_poll_once_notifies_new_earnings() -> None:
+    """One cycle notifies only earnings filings, never sleeps, and reports success."""
     filings = [
         FakeFiling("0001-26-000001", items=["Item 2.02"]),
         FakeFiling("0001-26-000002", items=["Item 9.01"]),
     ]
-    writes: list[str] = []
+    notified: list[Filing] = []
     warnings: list[str] = []
     sleeps: list[float] = []
+    seen: set[str] = set()
 
     succeeded = poll(
         fetch=lambda: filings,
-        write=writes.append,
+        notify=notified.append,
         warn=warnings.append,
         sleep=sleeps.append,
+        seen=seen,
         interval=60.0,
         once=True,
     )
 
     assert succeeded is True
-    assert writes == [EXPECTED_LINE + "\n"]
+    assert notified == [filings[0]]
     assert warnings == []
     assert sleeps == []
+    # 🧾 The injected seen set records every filing this cycle handled.
+    assert seen == {"0001-26-000001", "0001-26-000002"}
 
 
 def test_poll_warns_on_error_and_keeps_polling() -> None:
-    """A failed cycle warns, polling continues, and repeats are not written again."""
+    """A failed cycle warns, polling continues, and repeats are not notified again."""
     filing = FakeFiling("0001-26-000001", items=["Item 2.02"])
     responses: list[list[FakeFiling] | Exception] = [
         RuntimeError("network down"),
         [filing],
         [filing],
     ]
-    writes: list[str] = []
+    notified: list[Filing] = []
     warnings: list[str] = []
     sleeps: list[float] = []
+    seen: set[str] = set()
 
     def fetch() -> list[FakeFiling]:
         """🧪 Return the next scripted response, or raise it if it is an error."""
@@ -157,29 +162,31 @@ def test_poll_warns_on_error_and_keeps_polling() -> None:
     with pytest.raises(_StopPolling):
         poll(
             fetch=fetch,
-            write=writes.append,
+            notify=notified.append,
             warn=warnings.append,
             sleep=sleep,
+            seen=seen,
             interval=5.0,
             once=False,
         )
 
     assert len(warnings) == 1
     assert "network down" in warnings[0]
-    assert writes == [EXPECTED_LINE + "\n"]
+    assert notified == [filing]
 
 
-def test_poll_retries_filing_when_write_fails() -> None:
-    """A filing whose write failed is written again next cycle, with one warning."""
+def test_poll_retries_filing_when_notify_fails() -> None:
+    """A filing whose notify failed is notified again next cycle, with one warning."""
     filing = FakeFiling("0001-26-000001", items=["Item 2.02"])
-    write_attempts: list[str] = []
+    attempts: list[Filing] = []
     warnings: list[str] = []
     sleeps: list[float] = []
+    seen: set[str] = set()
 
-    def write(line: str) -> None:
-        """🧪 Fail the first write, then succeed."""
-        write_attempts.append(line)
-        if len(write_attempts) == 1:
+    def notify(item: Filing) -> None:
+        """🧪 Fail the first notify, then succeed."""
+        attempts.append(item)
+        if len(attempts) == 1:
             msg = "stdout closed"
             raise OSError(msg)
 
@@ -192,12 +199,13 @@ def test_poll_retries_filing_when_write_fails() -> None:
     with pytest.raises(_StopPolling):
         poll(
             fetch=lambda: [filing],
-            write=write,
+            notify=notify,
             warn=warnings.append,
             sleep=sleep,
+            seen=seen,
             interval=5.0,
             once=False,
         )
 
-    assert write_attempts == [EXPECTED_LINE + "\n"] * RETRY_CYCLES
+    assert attempts == [filing] * RETRY_CYCLES
     assert len(warnings) == 1

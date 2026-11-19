@@ -4,12 +4,21 @@ import argparse
 import os
 import sys
 import time
+from contextlib import closing
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from edgar import get_current_filings, set_identity
 
-from earningsbot.edgar import poll
+from earningsbot.edgar import format_filing, poll
+from earningsbot.state import SeenStore
+
+if TYPE_CHECKING:
+    from earningsbot.edgar import Filing
 
 IDENTITY_ENV = "EDGAR_IDENTITY"
+STATE_ENV = "EARNINGSBOT_STATE_PATH"
+DEFAULT_STATE_PATH = ".earningsbot/seen.sqlite3"
 USAGE_EXIT_CODE = 2
 
 
@@ -18,6 +27,17 @@ def _emit(text: str) -> None:
     # 🚰 Flushing matters when the output goes into a pipe.
     sys.stdout.write(text)
     sys.stdout.flush()
+
+
+def _notify(filing: Filing) -> None:
+    """Print one earnings filing as a line on stdout."""
+    _emit(format_filing(filing) + "\n")
+
+
+def _state_path() -> Path:
+    """Return the seen-store path from the environment, or the default when blank."""
+    # 🗂️ A blank value counts as unset, so an empty variable never picks the cwd.
+    return Path(os.environ.get(STATE_ENV, "").strip() or DEFAULT_STATE_PATH)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -44,14 +64,16 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(USAGE_EXIT_CODE)
 
     set_identity(identity)
-    succeeded = poll(
-        fetch=lambda: get_current_filings(form="8-K", page_size=100),
-        write=_emit,
-        warn=lambda message: sys.stderr.write(message + "\n"),
-        sleep=time.sleep,
-        interval=args.interval,
-        once=args.once,
-    )
+    with closing(SeenStore(_state_path())) as seen:
+        succeeded = poll(
+            fetch=lambda: get_current_filings(form="8-K", page_size=100),
+            notify=_notify,
+            warn=lambda message: sys.stderr.write(message + "\n"),
+            sleep=time.sleep,
+            seen=seen,
+            interval=args.interval,
+            once=args.once,
+        )
     # 🚦 A scripted run needs a non-zero exit when its one cycle failed.
     if args.once and not succeeded:
         raise SystemExit(1)

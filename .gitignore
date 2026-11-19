@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Local state, such as the seen-filings database
+.earningsbot/
+
 # Tool caches and coverage artifacts
 .pytest_cache/
 .ruff_cache/

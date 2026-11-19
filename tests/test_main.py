@@ -1,15 +1,32 @@
 """Tests for the earningsbot command line entry point."""
 
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
 import earningsbot
 from earningsbot import main
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
 IDENTITY_ENV = "EDGAR_IDENTITY"
+STATE_ENV = "EARNINGSBOT_STATE_PATH"
 USAGE_EXIT_CODE = 2
 FAILED_CYCLE_EXIT_CODE = 1
+EXPECTED_LINE = (
+    "2026-11-18  Acme Corp  CIK 320193  0001-26-000001  "
+    "https://www.sec.gov/index.html\n"
+)
+
+
+@pytest.fixture(autouse=True)
+def state_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """🧪 Point the seen store at a temp file so no test writes into the project."""
+    path = tmp_path / "state" / "seen.sqlite3"
+    monkeypatch.setenv(STATE_ENV, str(path))
+    return path
 
 
 @pytest.fixture
@@ -26,6 +43,28 @@ def identities(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr(earningsbot, "set_identity", recorded.append)
     monkeypatch.setattr(earningsbot.time, "sleep", no_sleep)
     return recorded
+
+
+@pytest.fixture
+def feed(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """🧪 Serve one earnings filing from a fake EDGAR feed and record each request."""
+    calls: list[dict[str, object]] = []
+    filing = SimpleNamespace(
+        accession_no="0001-26-000001",
+        company="Acme Corp",
+        cik=320193,
+        filing_date="2026-11-18",
+        homepage_url="https://www.sec.gov/index.html",
+        obj=lambda: SimpleNamespace(items=["Item 2.02"]),
+    )
+
+    def fake_get_current_filings(**kwargs: object) -> list[SimpleNamespace]:
+        """🧪 Record the feed request and return one earnings filing."""
+        calls.append(kwargs)
+        return [filing]
+
+    monkeypatch.setattr(earningsbot, "get_current_filings", fake_get_current_filings)
+    return calls
 
 
 @pytest.mark.parametrize("identity", [None, "", "   "])
@@ -48,36 +87,47 @@ def test_main_exits_2_without_identity(
 
 
 def test_main_once_sets_identity_and_polls(
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     identities: list[str],
+    feed: list[dict[str, object]],
 ) -> None:
     """With --once, main sets the identity, prints one line, and returns normally."""
-    feed_calls: list[dict[str, object]] = []
-    filing = SimpleNamespace(
-        accession_no="0001-26-000001",
-        company="Acme Corp",
-        cik=320193,
-        filing_date="2026-11-18",
-        homepage_url="https://www.sec.gov/index.html",
-        obj=lambda: SimpleNamespace(items=["Item 2.02"]),
-    )
-
-    def fake_get_current_filings(**kwargs: object) -> list[SimpleNamespace]:
-        """🧪 Record the feed request and return one earnings filing."""
-        feed_calls.append(kwargs)
-        return [filing]
-
-    monkeypatch.setattr(earningsbot, "get_current_filings", fake_get_current_filings)
-
     main(["--once"])
 
     assert identities == ["Test User test@example.com"]
-    assert feed_calls == [{"form": "8-K", "page_size": 100}]
-    assert capsys.readouterr().out == (
-        "2026-11-18  Acme Corp  CIK 320193  0001-26-000001  "
-        "https://www.sec.gov/index.html\n"
-    )
+    assert feed == [{"form": "8-K", "page_size": 100}]
+    assert capsys.readouterr().out == EXPECTED_LINE
+
+
+@pytest.mark.usefixtures("identities", "feed")
+def test_main_second_once_run_skips_seen_filings(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A filing printed by one --once run is not printed again by the next run."""
+    main(["--once"])
+    first_output = capsys.readouterr().out
+
+    main(["--once"])
+    second_output = capsys.readouterr().out
+
+    assert first_output == EXPECTED_LINE
+    assert second_output == ""
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+@pytest.mark.usefixtures("identities", "feed")
+def test_main_uses_default_state_path_when_blank(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    blank: str,
+) -> None:
+    """A blank EARNINGSBOT_STATE_PATH uses .earningsbot/ under the cwd."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(STATE_ENV, blank)
+
+    main(["--once"])
+
+    assert (tmp_path / ".earningsbot" / "seen.sqlite3").is_file()
 
 
 @pytest.mark.usefixtures("identities")
