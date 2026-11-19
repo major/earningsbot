@@ -1,4 +1,4 @@
-# newsbot
+# earningsbot
 
 ## Development
 

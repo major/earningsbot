@@ -1,1 +1,1 @@
-"""Test package for newsbot."""
+"""Test package for earningsbot."""

@@ -1,4 +1,4 @@
-"""Newsbot package entry point."""
+"""Earningsbot package entry point."""
 
 import sys
 
@@ -6,4 +6,4 @@ import sys
 def main() -> None:
     """Print the greeting to stdout."""
     # 👋 Writing to stdout directly keeps this stub free of T201 (print) warnings.
-    sys.stdout.write("Hello from newsbot!\n")
+    sys.stdout.write("Hello from earningsbot!\n")

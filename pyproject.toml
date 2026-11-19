@@ -1,5 +1,5 @@
 [project]
-name = "newsbot"
+name = "earningsbot"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -10,7 +10,7 @@ requires-python = ">=3.15"
 dependencies = []
 
 [project.scripts]
-newsbot = "newsbot:main"
+earningsbot = "earningsbot:main"
 
 [build-system]
 requires = ["uv_build>=0.13.8,<0.14.0"]
@@ -28,11 +28,11 @@ dev = [
 testpaths = ["tests"]
 strict_markers = true
 strict_config = true
-addopts = ["--cov=newsbot", "--cov-branch", "--cov-report=term-missing"]
+addopts = ["--cov=earningsbot", "--cov-branch", "--cov-report=term-missing"]
 
 [tool.coverage.run]
 branch = true
-source = ["newsbot"]
+source = ["earningsbot"]
 
 [tool.coverage.report]
 show_missing = true
