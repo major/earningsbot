@@ -1,11 +1,14 @@
 """Tests for the EDGAR earnings poller."""
 
+import json
+import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Any, Self
 
 import pytest
 
 from earningsbot.edgar import format_filing, is_earnings, new_earnings_filings, poll
+from earningsbot.log_config import JsonFormatter
 
 if TYPE_CHECKING:
     from earningsbot.edgar import Filing
@@ -17,6 +20,16 @@ EXPECTED_LINE = "2026-11-18  Acme Corp  CIK 320193  0001-26-000001  https://www.
 
 class _StopPolling(BaseException):
     """🛑 Test-only signal that ends the loop. Not an Exception, so poll keeps it."""
+
+
+def _records(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    """🧪 Return each captured log record as the JSON object it prints as."""
+    return [json.loads(JsonFormatter().format(record)) for record in caplog.records]
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    """🧪 Return the captured records at WARNING level."""
+    return [record for record in _records(caplog) if record["level"] == "warning"]
 
 
 @dataclass
@@ -100,21 +113,20 @@ def test_format_filing() -> None:
     assert format_filing(filing) == EXPECTED_LINE
 
 
-def test_poll_once_notifies_new_earnings() -> None:
-    """One cycle notifies only earnings filings, never sleeps, and reports success."""
+def test_poll_once_notifies_new_earnings(caplog: pytest.LogCaptureFixture) -> None:
+    """One cycle notifies only earnings filings, never sleeps, and logs the count."""
+    caplog.set_level(logging.INFO)
     filings = [
         FakeFiling("0001-26-000001", items=["Item 2.02"]),
         FakeFiling("0001-26-000002", items=["Item 9.01"]),
     ]
     notified: list[Filing] = []
-    warnings: list[str] = []
     sleeps: list[float] = []
     seen: set[str] = set()
 
     succeeded = poll(
         fetch=lambda: filings,
         notify=notified.append,
-        warn=warnings.append,
         sleep=sleeps.append,
         seen=seen,
         interval=60.0,
@@ -123,13 +135,16 @@ def test_poll_once_notifies_new_earnings() -> None:
 
     assert succeeded is True
     assert notified == [filings[0]]
-    assert warnings == []
+    assert _warnings(caplog) == []
     assert sleeps == []
     # 🧾 The injected seen set records every filing this cycle handled.
     assert seen == {"0001-26-000001", "0001-26-000002"}
+    finished = [record for record in _records(caplog) if record["msg"] == "poll cycle finished"]
+    assert [record["earnings"] for record in finished] == [1]
+    assert isinstance(finished[0]["duration_ms"], int)
 
 
-def test_poll_warns_on_error_and_keeps_polling() -> None:
+def test_poll_warns_on_error_and_keeps_polling(caplog: pytest.LogCaptureFixture) -> None:
     """A failed cycle warns, polling continues, and repeats are not notified again."""
     filing = FakeFiling("0001-26-000001", items=["Item 2.02"])
     responses: list[list[FakeFiling] | Exception] = [
@@ -138,7 +153,6 @@ def test_poll_warns_on_error_and_keeps_polling() -> None:
         [filing],
     ]
     notified: list[Filing] = []
-    warnings: list[str] = []
     sleeps: list[float] = []
     seen: set[str] = set()
 
@@ -159,23 +173,22 @@ def test_poll_warns_on_error_and_keeps_polling() -> None:
         poll(
             fetch=fetch,
             notify=notified.append,
-            warn=warnings.append,
             sleep=sleep,
             seen=seen,
             interval=5.0,
             once=False,
         )
 
-    assert len(warnings) == 1
-    assert "network down" in warnings[0]
+    warnings = _warnings(caplog)
+    assert [record["msg"] for record in warnings] == ["poll cycle failed"]
+    assert "network down" in warnings[0]["error"]
     assert notified == [filing]
 
 
-def test_poll_retries_filing_when_notify_fails() -> None:
+def test_poll_retries_filing_when_notify_fails(caplog: pytest.LogCaptureFixture) -> None:
     """A filing whose notify failed is notified again next cycle, with one warning."""
     filing = FakeFiling("0001-26-000001", items=["Item 2.02"])
     attempts: list[Filing] = []
-    warnings: list[str] = []
     sleeps: list[float] = []
     seen: set[str] = set()
 
@@ -196,7 +209,6 @@ def test_poll_retries_filing_when_notify_fails() -> None:
         poll(
             fetch=lambda: [filing],
             notify=notify,
-            warn=warnings.append,
             sleep=sleep,
             seen=seen,
             interval=5.0,
@@ -204,4 +216,4 @@ def test_poll_retries_filing_when_notify_fails() -> None:
         )
 
     assert attempts == [filing] * RETRY_CYCLES
-    assert len(warnings) == 1
+    assert len(_warnings(caplog)) == 1

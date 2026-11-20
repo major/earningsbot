@@ -56,5 +56,25 @@ podman run -d --name earningsbot \
 | `EDGAR_IDENTITY`            | yes      | Your `Name email` for the SEC User-Agent                      |
 | `DISCORD_EARNINGS_WEBHOOKS` | no       | Comma-separated Discord webhook URLs (secrets)                |
 | `EARNINGSBOT_STATE_PATH`    | no       | SQLite path. The image sets `/data/seen.sqlite3`              |
+| `EARNINGSBOT_LOG_LEVEL`     | no       | Log level (`DEBUG` to `CRITICAL`), default `INFO`             |
 | `STOCK_LOGO`                | no       | Logo URL template. `%s` becomes the lowercase ticker          |
 | `TRANSPARENT_PNG`           | no       | Image URL for filings without a known ticker logo             |
+
+## Logging
+
+earningsbot writes logs as JSON Lines to stderr. Each line is one JSON object with `ts`, `level`, `logger`, and `msg`. Extra fields become flat keys on the same line. Stdout keeps only the plain filing line, so piping stdout still works.
+
+Webhook URLs and your `EDGAR_IDENTITY` never appear in logs. Library logs from `httpx2` stay at `WARNING`, because its INFO lines contain webhook URLs.
+
+To read the logs in a readable form, pipe stderr through [hl](https://github.com/pamburus/hl):
+
+```sh
+earningsbot --once 2>&1 | hl -F
+podman logs -f earningsbot 2>&1 | hl -F
+```
+
+A record looks like this:
+
+```json
+{"ts":"2026-11-19T10:00:00.250Z","level":"info","logger":"earningsbot.edgar","msg":"poll cycle finished","earnings":1,"duration_ms":412}
+```

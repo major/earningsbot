@@ -2,12 +2,13 @@
 
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Any, Self
 
 import httpx2
 import pytest
 
 from earningsbot.discord import earnings_payload, notify_discord, send_payload
+from earningsbot.log_config import JsonFormatter
 from earningsbot.metrics import Metrics
 
 if TYPE_CHECKING:
@@ -20,6 +21,8 @@ ACME_LOGO = "https://logos.example/acme.webp"
 TRANSPARENT_PNG = "https://images.example/transparent.png"
 WEBHOOK_A = "https://discord.example/api/webhooks/1/token-a"
 WEBHOOK_B = "https://discord.example/api/webhooks/2/token-b"
+ACCESSION_NO = "0001-26-000001"
+TICKER = "ACME"
 LONG_COMPANY = "A" * 300
 LONG_TITLE = "A" * 255 + "…"
 EARNINGS_DESCRIPTION = "📄 Earnings release filed"
@@ -44,6 +47,12 @@ class FakeFiling:
 def _client(handler: Callable[[httpx2.Request], httpx2.Response]) -> httpx2.Client:
     """🧪 Build a client whose requests go to handler instead of the network."""
     return httpx2.Client(transport=httpx2.MockTransport(handler))
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    """🧪 Return each WARNING record as the JSON object it prints as."""
+    records = [json.loads(JsonFormatter().format(record)) for record in caplog.records]
+    return [record for record in records if record["level"] == "warning"]
 
 
 @pytest.mark.parametrize(
@@ -140,7 +149,13 @@ def test_send_payload_posts_json_to_each_webhook() -> None:
         return httpx2.Response(204)
 
     # Act
-    send_payload(_client(handler), [WEBHOOK_A, WEBHOOK_B], payload, warn=lambda _m: None)
+    send_payload(
+        _client(handler),
+        [WEBHOOK_A, WEBHOOK_B],
+        payload,
+        accession_no=ACCESSION_NO,
+        ticker=TICKER,
+    )
 
     # Assert
     assert [str(post.url) for post in posts] == [WEBHOOK_A, WEBHOOK_B]
@@ -148,11 +163,10 @@ def test_send_payload_posts_json_to_each_webhook() -> None:
     assert posts[0].content == '{"embeds":[{"title":"Café"}]}'.encode()
 
 
-def test_send_payload_collects_errors_without_leaking_urls() -> None:
+def test_send_payload_collects_errors_without_leaking_urls(caplog: pytest.LogCaptureFixture) -> None:
     """Every webhook is tried, retryable errors raise in order, and no URL leaks."""
     # Arrange
     posts: list[httpx2.Request] = []
-    messages: list[str] = []
     webhooks = [
         "https://server-error.example/hook/status-token",
         "https://down.example/hook/connect-token",
@@ -176,7 +190,13 @@ def test_send_payload_collects_errors_without_leaking_urls() -> None:
 
     # Act
     with pytest.raises(RuntimeError) as exc_info:
-        send_payload(_client(handler), webhooks, {"embeds": []}, warn=messages.append)
+        send_payload(
+            _client(handler),
+            webhooks,
+            {"embeds": []},
+            accession_no=ACCESSION_NO,
+            ticker=TICKER,
+        )
 
     # Assert
     message = str(exc_info.value)
@@ -185,22 +205,22 @@ def test_send_payload_collects_errors_without_leaking_urls() -> None:
         "webhook 2: post webhook: request failed; "
         "webhook 3: post webhook: deadline exceeded"
     )
-    assert messages == [
-        ("webhook 4: build webhook request: invalid webhook URL; skipped for this filing"),
+    warnings = _warnings(caplog)
+    assert [(record["msg"], record["webhook"], record["reason"]) for record in warnings] == [
+        ("webhook skipped", 4, "build webhook request: invalid webhook URL"),
     ]
     assert [post.url.host for post in posts] == ["good.example"]
-    text = " ".join([message, *messages])
+    text = f"{message} {caplog.text}"
     for secret in ("status-token", "connect-token", "timeout-token", "malformed-token"):
         assert secret not in text
     assert "good-token" not in text
 
 
 @pytest.mark.parametrize("webhook", ["not a url", "/relative", "https:///no-host"])
-def test_send_payload_skips_urls_without_a_host(webhook: str) -> None:
+def test_send_payload_skips_urls_without_a_host(webhook: str, caplog: pytest.LogCaptureFixture) -> None:
     """A URL with no scheme or host is skipped with a warning, and the next posts."""
     # Arrange
     posts: list[httpx2.Request] = []
-    messages: list[str] = []
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         """🧪 Record each post and accept it."""
@@ -208,21 +228,26 @@ def test_send_payload_skips_urls_without_a_host(webhook: str) -> None:
         return httpx2.Response(204)
 
     # Act
-    send_payload(_client(handler), [webhook, WEBHOOK_A], {"embeds": []}, warn=messages.append)
+    send_payload(
+        _client(handler),
+        [webhook, WEBHOOK_A],
+        {"embeds": []},
+        accession_no=ACCESSION_NO,
+        ticker=TICKER,
+    )
 
     # Assert
-    assert messages == [
-        ("webhook 1: build webhook request: invalid webhook URL; skipped for this filing"),
+    assert [(record["webhook"], record["reason"]) for record in _warnings(caplog)] == [
+        (1, "build webhook request: invalid webhook URL"),
     ]
     assert [str(post.url) for post in posts] == [WEBHOOK_A]
 
 
 @pytest.mark.parametrize("status", [301, 400, 401, 403, 404])
-def test_send_payload_skips_permanent_failures_with_a_warning(status: int) -> None:
+def test_send_payload_skips_permanent_failures_with_a_warning(status: int, caplog: pytest.LogCaptureFixture) -> None:
     """A permanent 4xx warns once and skips only that webhook. Later ones still post."""
     # Arrange
     posts: list[httpx2.Request] = []
-    messages: list[str] = []
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         """🧪 Reject the bad webhook with the given status, and accept the rest."""
@@ -236,23 +261,23 @@ def test_send_payload_skips_permanent_failures_with_a_warning(status: int) -> No
         _client(handler),
         [WEBHOOK_A, "https://bad.example/hook/bad-token", WEBHOOK_B],
         {"embeds": []},
-        warn=messages.append,
+        accession_no=ACCESSION_NO,
+        ticker=TICKER,
     )
 
     # Assert
-    assert messages == [
-        f"webhook 2: post webhook: unexpected status {status}; skipped for this filing",
+    assert [(record["msg"], record["webhook"], record["reason"]) for record in _warnings(caplog)] == [
+        ("webhook skipped", 2, f"post webhook: unexpected status {status}"),
     ]
     assert [str(post.url) for post in posts] == [WEBHOOK_A, WEBHOOK_B]
-    assert "bad-token" not in messages[0]
+    assert "bad-token" not in caplog.text
 
 
 @pytest.mark.parametrize("status", [408, 429, 500])
-def test_send_payload_raises_for_retryable_failures(status: int) -> None:
+def test_send_payload_raises_for_retryable_failures(status: int, caplog: pytest.LogCaptureFixture) -> None:
     """A timeout, rate limit, or server error raises for a retry, after all posts."""
     # Arrange
     posts: list[httpx2.Request] = []
-    messages: list[str] = []
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         """🧪 Fail the first webhook with the given status, and accept the second."""
@@ -267,13 +292,14 @@ def test_send_payload_raises_for_retryable_failures(status: int) -> None:
             _client(handler),
             ["https://flaky.example/hook/flaky-token", WEBHOOK_B],
             {"embeds": []},
-            warn=messages.append,
+            accession_no=ACCESSION_NO,
+            ticker=TICKER,
         )
 
     # Assert
     assert str(exc_info.value) == f"webhook 1: post webhook: unexpected status {status}"
     assert "flaky-token" not in str(exc_info.value)
-    assert messages == []
+    assert _warnings(caplog) == []
     assert [str(post.url) for post in posts] == [WEBHOOK_B]
 
 
@@ -326,7 +352,8 @@ def test_send_payload_names_unexpected_errors_by_type_only(
             client,
             ["https://odd.example/hook/odd-token", WEBHOOK_B],
             {"embeds": []},
-            warn=lambda _m: None,
+            accession_no=ACCESSION_NO,
+            ticker=TICKER,
         )
 
     # Assert
@@ -342,17 +369,20 @@ def _raising_lookup(_cik: int | str) -> str:
 
 
 @pytest.mark.parametrize(
-    "lookup",
+    ("lookup", "warned"),
     [
-        pytest.param(_raising_lookup, id="raises"),
-        pytest.param(lambda _cik: "", id="empty"),
-        pytest.param(lambda _cik: None, id="not-a-string"),
+        pytest.param(_raising_lookup, True, id="raises"),
+        pytest.param(lambda _cik: "", False, id="empty"),
+        pytest.param(lambda _cik: None, False, id="not-a-string"),
     ],
 )
 def test_notify_discord_uses_company_when_ticker_lookup_fails(
     lookup: Callable[[int | str], object],
+    *,
+    warned: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A failing or unusable ticker lookup still sends the alert, titled by company."""
+    """A failing or unusable ticker lookup still sends the alert, titled by company. Only a raised error warns."""
     # Arrange
     posts: list[httpx2.Request] = []
 
@@ -368,7 +398,6 @@ def test_notify_discord_uses_company_when_ticker_lookup_fails(
         webhooks=[WEBHOOK_A],
         stock_logo=STOCK_LOGO,
         transparent_png=TRANSPARENT_PNG,
-        warn=lambda _m: None,
         lookup_ticker=lookup,
         get_metrics=lambda _filing: Metrics(),
     )
@@ -377,10 +406,12 @@ def test_notify_discord_uses_company_when_ticker_lookup_fails(
     embed = json.loads(posts[0].content)["embeds"][0]
     assert embed["title"] == "Acme Corp"
     assert embed["thumbnail"] == {"url": TRANSPARENT_PNG}
+    expected = [("ticker lookup failed", "OSError")] if warned else []
+    assert [(record["msg"], record["error"]) for record in _warnings(caplog)] == expected
 
 
-def test_notify_discord_sends_basic_alert_when_metrics_fail() -> None:
-    """A failed metrics lookup still posts the alert, with the basic description."""
+def test_notify_discord_sends_basic_alert_when_metrics_fail(caplog: pytest.LogCaptureFixture) -> None:
+    """A failed metrics lookup still posts the alert, with the basic description and a warning."""
     # Arrange
     posts: list[httpx2.Request] = []
 
@@ -401,7 +432,6 @@ def test_notify_discord_sends_basic_alert_when_metrics_fail() -> None:
         webhooks=[WEBHOOK_A],
         stock_logo=STOCK_LOGO,
         transparent_png=TRANSPARENT_PNG,
-        warn=lambda _m: None,
         lookup_ticker=lambda _cik: "ACME",
         get_metrics=failing_metrics,
     )
@@ -410,3 +440,6 @@ def test_notify_discord_sends_basic_alert_when_metrics_fail() -> None:
     embed = json.loads(posts[0].content)["embeds"][0]
     assert embed["description"] == EARNINGS_DESCRIPTION
     assert embed["title"] == "ACME: Acme Corp"
+    assert [(record["msg"], record["accession_no"], record["error"]) for record in _warnings(caplog)] == [
+        ("metrics lookup failed", ACCESSION_NO, "RuntimeError"),
+    ]

@@ -4,6 +4,7 @@
 """
 
 import json
+import logging
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, NotRequired, TypedDict
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from earningsbot.edgar import Filing
+
+logger = logging.getLogger(__name__)
 
 _TITLE_LIMIT = 256
 _WEBHOOK_TIMEOUT_SECONDS = 10.0
@@ -84,21 +87,22 @@ def earnings_payload(
     return {"embeds": [embed]}
 
 
-def send_payload(
+def send_payload(  # noqa: PLR0913 - the log fields are keywords, like the other injected values
     client: httpx2.Client,
     webhooks: Sequence[str],
     payload: WebhookPayload,
     *,
-    warn: Callable[[str], object],
+    accession_no: str,
+    ticker: str,
     timeout: float = _WEBHOOK_TIMEOUT_SECONDS,
 ) -> None:
     """Post the payload to each webhook, then raise once if a retryable post failed.
 
-    A permanent failure, such as a deleted webhook, calls ``warn`` and skips only
+    A permanent failure, such as a deleted webhook, logs a warning and skips only
     that webhook, so it cannot repost the filing to the others forever. A
     retryable failure raises, so the filing is retried next cycle. Every webhook
-    is tried, even after one fails. Error text never includes a webhook URL,
-    because the URL carries a secret token. 🔒
+    is tried, even after one fails. Logs and error text carry the webhook number,
+    never its URL, because the URL carries a secret token. 🔒
     """
     # 🧾 Compact JSON keeps each body small, and raw UTF-8 keeps names readable.
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -106,9 +110,15 @@ def send_payload(
     for number, webhook in enumerate(webhooks, start=1):
         failure = _post(client, webhook, body, timeout)
         if failure is None:
-            continue
-        if failure.permanent:
-            warn(f"webhook {number}: {failure.message}; skipped for this filing")
+            logger.info(
+                "discord post sent",
+                extra={"webhook": number, "accession_no": accession_no, "ticker": ticker},
+            )
+        elif failure.permanent:
+            logger.warning(
+                "webhook skipped",
+                extra={"webhook": number, "accession_no": accession_no, "reason": failure.message},
+            )
         else:
             retryable.append(f"webhook {number}: {failure.message}")
     if retryable:
@@ -122,11 +132,10 @@ def notify_discord(  # noqa: PLR0913 - the spec fixes these injected dependencie
     webhooks: Sequence[str],
     stock_logo: str,
     transparent_png: str,
-    warn: Callable[[str], object],
     lookup_ticker: Callable[[int | str], object] = find_ticker,
     get_metrics: Callable[[Filing], Metrics] = fetch_metrics,
 ) -> None:
-    """Post an embed to each webhook. Permanent failures warn, retryable ones raise."""
+    """Post an embed to each webhook. Permanent failures log a warning, retryable ones raise."""
     ticker = _ticker_or_empty(filing.cik, lookup_ticker)
     metrics = _metrics_or_empty(filing, get_metrics)
     payload = earnings_payload(
@@ -136,7 +145,13 @@ def notify_discord(  # noqa: PLR0913 - the spec fixes these injected dependencie
         transparent_png=transparent_png,
         metrics=metrics,
     )
-    send_payload(client, webhooks, payload, warn=warn)
+    send_payload(
+        client,
+        webhooks,
+        payload,
+        accession_no=filing.accession_no,
+        ticker=ticker,
+    )
 
 
 def _description(metrics: Metrics) -> str:
@@ -158,7 +173,10 @@ def _metrics_or_empty(
     # 🛟 Metrics are a bonus, so an extraction failure must never block the alert.
     try:
         return get_metrics(filing)
-    except Exception:  # noqa: BLE001 - any failure falls back to the basic alert
+    except Exception as err:  # noqa: BLE001 - any failure falls back to the basic alert
+        logger.warning(
+            "metrics lookup failed", extra={"accession_no": filing.accession_no, "error": type(err).__name__}
+        )
         return Metrics()
 
 
@@ -167,7 +185,8 @@ def _ticker_or_empty(cik: int, lookup_ticker: Callable[[int | str], object]) -> 
     # 🛟 The ticker is optional, so a lookup failure must never block the alert.
     try:
         ticker = lookup_ticker(cik)
-    except Exception:  # noqa: BLE001 - any lookup failure falls back to the company name
+    except Exception as err:  # noqa: BLE001 - any lookup failure falls back to the company name
+        logger.warning("ticker lookup failed", extra={"cik": cik, "error": type(err).__name__})
         return ""
     return ticker if isinstance(ticker, str) else ""
 
