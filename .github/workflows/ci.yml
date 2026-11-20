@@ -1,0 +1,145 @@
+# 🔁 CI for earningsbot. It runs the checks, builds the container image, and reports one gate result.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 🔒 Least privilege by default. A job adds more permissions only when it needs them.
+permissions:
+  contents: read
+
+# 🧹 On pull requests, a new push cancels the older run. Runs on main always finish.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: make all
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # 🔐 uv fails the run if uv.lock is stale, so the lock file stays the source of truth.
+      UV_LOCKED: "1"
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 🗂️ We do not cache .ruff_cache or .pytest_cache. Their freshness checks depend on file
+      # 🕒 mtimes, and a fresh checkout resets those, so a restored cache would rarely hit.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          # 📌 Keep this version in sync with the uv pin in the Containerfile.
+          version: "0.13.9"
+          enable-cache: true
+          # 🐍 Python comes from .python-version (3.15). cache-python keeps the managed install.
+          cache-python: true
+          prune-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Run make all
+        run: make all
+
+  container:
+    name: container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # 📦 packages:write is used only for the push on main.
+      packages: write
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+
+      - name: Compute image tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # 🏗️ Build one local image for testing. This build is single platform (linux/amd64) only.
+      - name: Build image for testing
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: Containerfile
+          load: true
+          push: false
+          tags: earningsbot:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # ✂️ Skip provenance for this local test image. We do not need the attestation here.
+          provenance: false
+
+      - name: Smoke test the image
+        run: |
+          # 🧪 --help must exit 0.
+          docker run --rm earningsbot:ci --help
+          # 🚪 Without EDGAR_IDENTITY, the app must exit 2. The "|| code=$?" form stops
+          # 🛡️ bash -e from ending the step on the expected failure.
+          code=0
+          docker run --rm earningsbot:ci --once || code=$?
+          test "$code" -eq 2
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550  # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 🚀 Push on main only. This second build is fast because every layer comes from the
+      # ⚡ cache that the test build wrote, so it does not rebuild anything.
+      - name: Build and push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: Containerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          provenance: mode=max
+          sbom: true
+
+  # 🚦 This gate job keeps the required check name ("ci") stable. It fails closed: a failed,
+  # 🚦 skipped, or cancelled job in "needs" makes this job fail too.
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    needs: [check, container]
+    if: always()
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to succeed
+        env:
+          # 🛡️ Results go through env variables, so the script never has inline expressions.
+          CHECK_RESULT: ${{ needs.check.result }}
+          CONTAINER_RESULT: ${{ needs.container.result }}
+        run: |
+          if [ "$CHECK_RESULT" != "success" ] || [ "$CONTAINER_RESULT" != "success" ]; then
+            echo "check: $CHECK_RESULT, container: $CONTAINER_RESULT"
+            exit 1
+          fi
+          echo "All jobs succeeded"
