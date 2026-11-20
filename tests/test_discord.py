@@ -140,9 +140,7 @@ def test_send_payload_posts_json_to_each_webhook() -> None:
         return httpx2.Response(204)
 
     # Act
-    send_payload(
-        _client(handler), [WEBHOOK_A, WEBHOOK_B], payload, warn=lambda _m: None
-    )
+    send_payload(_client(handler), [WEBHOOK_A, WEBHOOK_B], payload, warn=lambda _m: None)
 
     # Assert
     assert [str(post.url) for post in posts] == [WEBHOOK_A, WEBHOOK_B]
@@ -188,10 +186,7 @@ def test_send_payload_collects_errors_without_leaking_urls() -> None:
         "webhook 3: post webhook: deadline exceeded"
     )
     assert messages == [
-        (
-            "webhook 4: build webhook request: invalid webhook URL; "
-            "skipped for this filing"
-        ),
+        ("webhook 4: build webhook request: invalid webhook URL; skipped for this filing"),
     ]
     assert [post.url.host for post in posts] == ["good.example"]
     text = " ".join([message, *messages])
@@ -213,16 +208,11 @@ def test_send_payload_skips_urls_without_a_host(webhook: str) -> None:
         return httpx2.Response(204)
 
     # Act
-    send_payload(
-        _client(handler), [webhook, WEBHOOK_A], {"embeds": []}, warn=messages.append
-    )
+    send_payload(_client(handler), [webhook, WEBHOOK_A], {"embeds": []}, warn=messages.append)
 
     # Assert
     assert messages == [
-        (
-            "webhook 1: build webhook request: invalid webhook URL; "
-            "skipped for this filing"
-        ),
+        ("webhook 1: build webhook request: invalid webhook URL; skipped for this filing"),
     ]
     assert [str(post.url) for post in posts] == [WEBHOOK_A]
 

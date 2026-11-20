@@ -88,9 +88,7 @@ def _require_http_urls(webhooks: list[str]) -> None:
     # 🧭 Checked before polling, so a typo fails at once instead of on every cycle.
     for number, webhook in enumerate(webhooks, start=1):
         if not _is_http_url(webhook):
-            sys.stderr.write(
-                f"error: {WEBHOOKS_ENV} entry {number} is not a valid http(s) URL\n"
-            )
+            sys.stderr.write(f"error: {WEBHOOKS_ENV} entry {number} is not a valid http(s) URL\n")
             raise SystemExit(USAGE_EXIT_CODE)
 
 
@@ -139,10 +137,7 @@ def main(argv: list[str] | None = None) -> None:
     # 🪪 SEC needs a name and contact in the User-Agent, so refuse to run without one.
     identity = os.environ.get(IDENTITY_ENV, "").strip()
     if not identity:
-        sys.stderr.write(
-            f"error: set {IDENTITY_ENV} to 'Your Name your@email' "
-            "so SEC can identify this client\n"
-        )
+        sys.stderr.write(f"error: set {IDENTITY_ENV} to 'Your Name your@email' so SEC can identify this client\n")
         raise SystemExit(USAGE_EXIT_CODE)
 
     set_identity(identity)
