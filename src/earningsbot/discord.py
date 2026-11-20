@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, NotRequired, TypedDict
 import httpx2
 from edgar.reference.tickers import find_ticker
 
+from earningsbot.metrics import Metrics, fetch_metrics, format_eps, format_revenue
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
@@ -48,8 +50,9 @@ def earnings_payload(
     *,
     stock_logo: str,
     transparent_png: str,
+    metrics: Metrics | None = None,
 ) -> WebhookPayload:
-    """Build one embed for an earnings filing, with the ticker when one is known."""
+    """Build one embed for a filing, with the ticker and metrics when known."""
     if ticker:
         title = f"{ticker}: {filing.company}"
         # 🖼️ The logo template takes the lowercase ticker, as in the stocknews project.
@@ -60,7 +63,7 @@ def earnings_payload(
     embed: Embed = {
         "title": _limit_embed_text(title, _TITLE_LIMIT),
         "url": filing.homepage_url,
-        "description": _EARNINGS_DESCRIPTION,
+        "description": _description(metrics or Metrics()),
         "image": {"url": transparent_png},
         "thumbnail": {"url": thumbnail},
     }
@@ -98,16 +101,42 @@ def notify_discord(  # noqa: PLR0913 - the spec fixes these injected dependencie
     stock_logo: str,
     transparent_png: str,
     lookup_ticker: Callable[[int | str], object] = find_ticker,
+    get_metrics: Callable[[Filing], Metrics] = fetch_metrics,
 ) -> None:
     """Post an embed for the filing to each webhook. Failures raise for a retry."""
     ticker = _ticker_or_empty(filing.cik, lookup_ticker)
+    metrics = _metrics_or_empty(filing, get_metrics)
     payload = earnings_payload(
         filing,
         ticker,
         stock_logo=stock_logo,
         transparent_png=transparent_png,
+        metrics=metrics,
     )
     send_payload(client, webhooks, payload)
+
+
+def _description(metrics: Metrics) -> str:
+    """Return the release line, then one line per known EPS and revenue value."""
+    lines = [_EARNINGS_DESCRIPTION]
+    # 📊 EPS first, then revenue. Each line shows only when its value is known.
+    if metrics.eps is not None:
+        lines.append(f"📊 EPS: {format_eps(metrics.eps)} ({metrics.eps_basis})")
+    if metrics.revenue is not None:
+        lines.append(f"📊 Revenue: {format_revenue(metrics.revenue)}")
+    return "\n".join(lines)
+
+
+def _metrics_or_empty(
+    filing: Filing,
+    get_metrics: Callable[[Filing], Metrics],
+) -> Metrics:
+    """Return the filing's metrics, or empty Metrics when the lookup fails."""
+    # 🛟 Metrics are a bonus, so an extraction failure must never block the alert.
+    try:
+        return get_metrics(filing)
+    except Exception:  # noqa: BLE001 - any failure falls back to the basic alert
+        return Metrics()
 
 
 def _ticker_or_empty(cik: int, lookup_ticker: Callable[[int | str], object]) -> str:

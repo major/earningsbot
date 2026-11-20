@@ -8,6 +8,7 @@ import httpx2
 import pytest
 
 from earningsbot.discord import earnings_payload, notify_discord, send_payload
+from earningsbot.metrics import Metrics
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -43,6 +44,48 @@ class FakeFiling:
 def _client(handler: Callable[[httpx2.Request], httpx2.Response]) -> httpx2.Client:
     """🧪 Build a client whose requests go to handler instead of the network."""
     return httpx2.Client(transport=httpx2.MockTransport(handler))
+
+
+@pytest.mark.parametrize(
+    ("metrics", "description"),
+    [
+        pytest.param(
+            Metrics(revenue=19_589_000.0, eps=-1.06, eps_basis="diluted"),
+            "📄 Earnings release filed\n📊 EPS: -$1.06 (diluted)\n📊 Revenue: $19.6M",
+            id="full",
+        ),
+        pytest.param(
+            Metrics(revenue=44_848_000.0),
+            "📄 Earnings release filed\n📊 Revenue: $44.8M",
+            id="revenue-only",
+        ),
+        pytest.param(
+            Metrics(eps=-0.11, eps_basis="basic"),
+            "📄 Earnings release filed\n📊 EPS: -$0.11 (basic)",
+            id="eps-only",
+        ),
+        pytest.param(None, EARNINGS_DESCRIPTION, id="no-metrics"),
+    ],
+)
+def test_earnings_payload_with_metrics(
+    metrics: Metrics | None,
+    description: str,
+) -> None:
+    """The first line stays fixed, and known EPS and revenue lines follow it."""
+    # Arrange
+    filing = FakeFiling()
+
+    # Act
+    payload = earnings_payload(
+        filing,
+        "ACME",
+        stock_logo=STOCK_LOGO,
+        transparent_png=TRANSPARENT_PNG,
+        metrics=metrics,
+    )
+
+    # Assert
+    assert payload["embeds"][0]["description"] == description
 
 
 @pytest.mark.parametrize(
@@ -201,9 +244,42 @@ def test_notify_discord_uses_company_when_ticker_lookup_fails(
         stock_logo=STOCK_LOGO,
         transparent_png=TRANSPARENT_PNG,
         lookup_ticker=lookup,
+        get_metrics=lambda _filing: Metrics(),
     )
 
     # Assert
     embed = json.loads(posts[0].content)["embeds"][0]
     assert embed["title"] == "Acme Corp"
     assert embed["thumbnail"] == {"url": TRANSPARENT_PNG}
+
+
+def test_notify_discord_sends_basic_alert_when_metrics_fail() -> None:
+    """A failed metrics lookup still posts the alert, with the basic description."""
+    # Arrange
+    posts: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        """🧪 Record each post and accept it."""
+        posts.append(request)
+        return httpx2.Response(204)
+
+    def failing_metrics(_filing: object) -> Metrics:
+        """🧪 Simulate an extraction failure inside edgartools."""
+        msg = "release parse failed"
+        raise RuntimeError(msg)
+
+    # Act
+    notify_discord(
+        FakeFiling(),
+        client=_client(handler),
+        webhooks=[WEBHOOK_A],
+        stock_logo=STOCK_LOGO,
+        transparent_png=TRANSPARENT_PNG,
+        lookup_ticker=lambda _cik: "ACME",
+        get_metrics=failing_metrics,
+    )
+
+    # Assert
+    embed = json.loads(posts[0].content)["embeds"][0]
+    assert embed["description"] == EARNINGS_DESCRIPTION
+    assert embed["title"] == "ACME: Acme Corp"

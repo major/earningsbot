@@ -10,6 +10,7 @@ import pytest
 
 import earningsbot
 from earningsbot import main
+from earningsbot.metrics import Metrics
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -183,6 +184,8 @@ def _patch_discord(
         functools.partial(httpx2.Client, transport=transport),
     )
     monkeypatch.setattr(earningsbot, "find_ticker", lambda _cik: "ACME")
+    # 📊 Stub the metrics lookup so no test reads a real release from EDGAR.
+    monkeypatch.setattr(earningsbot, "fetch_metrics", lambda _filing: Metrics())
     return posts
 
 

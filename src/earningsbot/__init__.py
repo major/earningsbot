@@ -14,6 +14,7 @@ from edgar.reference.tickers import find_ticker
 
 from earningsbot.discord import notify_discord
 from earningsbot.edgar import format_filing, poll
+from earningsbot.metrics import fetch_metrics
 from earningsbot.state import SeenStore
 
 if TYPE_CHECKING:
@@ -80,6 +81,8 @@ def _discord_notifier(
             stock_logo=stock_logo,
             transparent_png=transparent_png,
             lookup_ticker=find_ticker,
+            # 📊 Passed in like find_ticker, so tests can patch it in this module.
+            get_metrics=fetch_metrics,
         )
 
     return notify
