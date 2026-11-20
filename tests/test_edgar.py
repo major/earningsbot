@@ -12,9 +12,7 @@ if TYPE_CHECKING:
 
 CYCLES_BEFORE_STOP = 3
 RETRY_CYCLES = 2
-EXPECTED_LINE = (
-    "2026-11-18  Acme Corp  CIK 320193  0001-26-000001  https://www.sec.gov/index.html"
-)
+EXPECTED_LINE = "2026-11-18  Acme Corp  CIK 320193  0001-26-000001  https://www.sec.gov/index.html"
 
 
 class _StopPolling(BaseException):
@@ -67,9 +65,7 @@ def test_new_earnings_filings_returns_only_unseen_earnings() -> None:
         looked_up.append(filing.accession_no)
         return items_by_accession[filing.accession_no]
 
-    result = list(
-        new_earnings_filings([already_seen, not_earnings, earnings], seen, get_items)
-    )
+    result = list(new_earnings_filings([already_seen, not_earnings, earnings], seen, get_items))
 
     assert result == [earnings]
     assert seen == {"0001-26-000001", "0001-26-000002", "0001-26-000003"}

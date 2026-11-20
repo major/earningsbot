@@ -23,10 +23,7 @@ WEBHOOKS_ENV = "DISCORD_EARNINGS_WEBHOOKS"
 USAGE_EXIT_CODE = 2
 FAILED_CYCLE_EXIT_CODE = 1
 RETRY_POST_COUNT = 2
-EXPECTED_LINE = (
-    "2026-11-18  Acme Corp  CIK 320193  0001-26-000001  "
-    "https://www.sec.gov/index.html\n"
-)
+EXPECTED_LINE = "2026-11-18  Acme Corp  CIK 320193  0001-26-000001  https://www.sec.gov/index.html\n"
 
 
 @pytest.fixture(autouse=True)
@@ -240,9 +237,7 @@ def test_main_exits_2_on_invalid_webhook_url(
     # Assert
     err = capsys.readouterr().err
     assert exc_info.value.code == USAGE_EXIT_CODE
-    assert (
-        err == "error: DISCORD_EARNINGS_WEBHOOKS entry 2 is not a valid http(s) URL\n"
-    )
+    assert err == "error: DISCORD_EARNINGS_WEBHOOKS entry 2 is not a valid http(s) URL\n"
     assert feed == []
     assert posts == []
 
@@ -265,10 +260,7 @@ def test_main_permanent_webhook_failure_does_not_repeat(
 
     # Assert
     assert first.out == EXPECTED_LINE
-    assert (
-        "webhook 2: post webhook: unexpected status 404; skipped for this filing"
-        in first.err
-    )
+    assert "webhook 2: post webhook: unexpected status 404; skipped for this filing" in first.err
     assert [str(post.url) for post in posts] == ["https://a/x", "https://b/y"]
     assert second.out == ""
     assert second.err == ""

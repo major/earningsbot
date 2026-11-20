@@ -93,10 +93,7 @@ def new_earnings_filings(
 
 def format_filing(filing: Filing) -> str:
     """Return one line: filing date, company, CIK, accession number, and URL."""
-    return (
-        f"{filing.filing_date}  {filing.company}  CIK {filing.cik}  "
-        f"{filing.accession_no}  {filing.homepage_url}"
-    )
+    return f"{filing.filing_date}  {filing.company}  CIK {filing.cik}  {filing.accession_no}  {filing.homepage_url}"
 
 
 def poll(  # noqa: PLR0913 - the spec fixes these injected dependencies as keywords

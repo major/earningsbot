@@ -16,9 +16,7 @@ class SeenStore:
         file_path = Path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(file_path)
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS seen_filings (accession_no TEXT PRIMARY KEY)"
-        )
+        self._conn.execute("CREATE TABLE IF NOT EXISTS seen_filings (accession_no TEXT PRIMARY KEY)")
         self._conn.commit()
 
     def __contains__(self, accession_no: object) -> bool:
@@ -26,9 +24,7 @@ class SeenStore:
         # 🔢 Only text can be an accession number, so any other key is never seen.
         if not isinstance(accession_no, str):
             return False
-        row = self._conn.execute(
-            "SELECT 1 FROM seen_filings WHERE accession_no = ?", (accession_no,)
-        ).fetchone()
+        row = self._conn.execute("SELECT 1 FROM seen_filings WHERE accession_no = ?", (accession_no,)).fetchone()
         return row is not None
 
     def add(self, accession_no: str) -> None:

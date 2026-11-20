@@ -221,9 +221,7 @@ def _post_request(
         return None
     status = response.status_code
     # 🧭 Only 408, 429, and 5xx may pass later. Every other status is permanent.
-    retryable = (
-        status in _RETRYABLE_STATUSES or status >= HTTPStatus.INTERNAL_SERVER_ERROR
-    )
+    retryable = status in _RETRYABLE_STATUSES or status >= HTTPStatus.INTERNAL_SERVER_ERROR
     return _PostError(
         f"post webhook: unexpected status {status}",
         permanent=not retryable,
