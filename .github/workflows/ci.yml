@@ -57,6 +57,9 @@ jobs:
       contents: read
       # 📦 packages:write is used only for the push on main.
       packages: write
+    # 🔗 The image digest. The bump-homehosted job reads it to pin the new image.
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - name: Check out the code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -110,6 +113,7 @@ jobs:
       # 🚀 Push on main only. This second build is fast because every layer comes from the
       # ⚡ cache that the test build wrote, so it does not rebuild anything.
       - name: Build and push image
+        id: push
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
@@ -121,6 +125,80 @@ jobs:
           cache-from: type=gha
           provenance: mode=max
           sbom: true
+
+  # 🚀 Point the homehosted Flux HelmRelease at the new image digest so Flux rolls it out.
+  # 🛟 This job is not in the "ci" gate's needs. A homehosted problem must not turn the required check red.
+  bump-homehosted:
+    name: bump homehosted
+    needs: [container]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    # 🔒 One bump at a time. A second merge waits instead of pushing at the same time.
+    concurrency:
+      group: bump-homehosted
+      cancel-in-progress: false
+    env:
+      # 🛡️ Values go through env variables, so run scripts never have inline expressions.
+      DIGEST: ${{ needs.container.outputs.digest }}
+      HELMRELEASE: apps/earningsbot/helm/helmrelease.yaml
+    steps:
+      - name: Check that the homehosted token is set
+        env:
+          HOMEHOSTED_PAT: ${{ secrets.HOMEHOSTED_PAT }}
+        run: |
+          if [ -z "$HOMEHOSTED_PAT" ]; then
+            echo "::error::The HOMEHOSTED_PAT secret is not set"
+            exit 1
+          fi
+
+      - name: Check out major/homehosted
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: major/homehosted
+          token: ${{ secrets.HOMEHOSTED_PAT }}
+          path: homehosted
+          # 🔑 Keep the credentials on purpose. The push at the end needs them.
+          persist-credentials: true
+
+      - name: Update deployment manifest
+        working-directory: homehosted
+        run: |
+          # 🔍 Check the digest format before it goes into sed.
+          if ! [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::The image digest is missing or malformed"
+            exit 1
+          fi
+
+          # 📄 Fail when the manifest is missing. Never skip silently.
+          if [ ! -f "$HELMRELEASE" ]; then
+            echo "::error::$HELMRELEASE does not exist in major/homehosted"
+            exit 1
+          fi
+
+          sed -i "s|tag: latest@sha256:[a-f0-9]*|tag: latest@${DIGEST}|" "$HELMRELEASE"
+
+          # 🔍 Fail if the tag line was not found, so a changed file layout cannot pass silently
+          grep -qF "tag: latest@${DIGEST}" "$HELMRELEASE" || {
+            echo "::error::No 'tag: latest@sha256:' line found in $HELMRELEASE"
+            exit 1
+          }
+
+          if git diff --quiet -- "$HELMRELEASE"; then
+            echo "No changes to $HELMRELEASE, skipping commit"
+            exit 0
+          fi
+
+          git add "$HELMRELEASE"
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git commit -m "🤖 Update earningsbot deployment to ${DIGEST}"
+
+          # 🔄 Rebase onto a homehosted commit that landed after our checkout, then push.
+          git pull --rebase origin main
+          git push origin HEAD:main
 
   # 🚦 This gate job keeps the required check name ("ci") stable. It fails closed: a failed,
   # 🚦 skipped, or cancelled job in "needs" makes this job fail too.
