@@ -1,12 +1,14 @@
 """Tests for Discord embed payloads and webhook delivery."""
 
 import json
+import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any
 
 import httpx2
 import pytest
 
+from earningsbot import discord
 from earningsbot.discord import earnings_payload, notify_discord, send_payload
 from earningsbot.log_config import JsonFormatter
 from earningsbot.metrics import Metrics
@@ -29,6 +31,13 @@ EARNINGS_DESCRIPTION = "📄 Earnings release filed"
 
 
 @dataclass
+class FakeIndexHeaders:
+    """🧪 Stand-in for the index-headers page, which the Discord code never reads."""
+
+    items: list[str]
+
+
+@dataclass
 class FakeFiling:
     """🧪 Stand-in for an edgartools Filing with the fields Discord code reads."""
 
@@ -39,9 +48,10 @@ class FakeFiling:
     homepage_url: str = "https://www.sec.gov/index.html"
     items: list[str] = field(default_factory=lambda: ["Item 2.02"])
 
-    def obj(self) -> Self:
-        """🧪 Return self, since the fake's items play the role of the EightK report."""
-        return self
+    @property
+    def index_headers(self) -> FakeIndexHeaders:
+        """🧪 Return the items without the "Item " prefix, as the index-headers page lists them."""
+        return FakeIndexHeaders(items=[item.removeprefix("Item ") for item in self.items])
 
 
 def _client(handler: Callable[[httpx2.Request], httpx2.Response]) -> httpx2.Client:
@@ -442,4 +452,42 @@ def test_notify_discord_sends_basic_alert_when_metrics_fail(caplog: pytest.LogCa
     assert embed["title"] == "ACME: Acme Corp"
     assert [(record["msg"], record["accession_no"], record["error"]) for record in _warnings(caplog)] == [
         ("metrics lookup failed", ACCESSION_NO, "RuntimeError"),
+    ]
+
+
+def test_notify_discord_posts_basic_alert_when_metrics_time_out(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A metrics lookup past its limit still posts the basic alert, and the warning names TimeoutError."""
+    # Arrange
+    monkeypatch.setattr(discord, "METRICS_TIMEOUT_SECONDS", 0.05)
+    posts: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        """🧪 Record each post and accept it."""
+        posts.append(request)
+        return httpx2.Response(204)
+
+    def slow_metrics(_filing: object) -> Metrics:
+        """🧪 Run past the limit, as a stalled release download would, then return real numbers."""
+        time.sleep(1)
+        return Metrics(eps=1.5, eps_basis="GAAP")
+
+    # Act
+    notify_discord(
+        FakeFiling(),
+        client=_client(handler),
+        webhooks=[WEBHOOK_A],
+        stock_logo=STOCK_LOGO,
+        transparent_png=TRANSPARENT_PNG,
+        lookup_ticker=lambda _cik: "ACME",
+        get_metrics=slow_metrics,
+    )
+
+    # Assert
+    embed = json.loads(posts[0].content)["embeds"][0]
+    assert embed["description"] == EARNINGS_DESCRIPTION
+    assert [(record["msg"], record["accession_no"], record["error"]) for record in _warnings(caplog)] == [
+        ("metrics lookup failed", ACCESSION_NO, "TimeoutError"),
     ]

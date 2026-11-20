@@ -73,7 +73,7 @@ def feed(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
         cik=320193,
         filing_date="2026-11-18",
         homepage_url="https://www.sec.gov/index.html",
-        obj=lambda: SimpleNamespace(items=["Item 2.02"]),
+        index_headers=SimpleNamespace(items=["2.02"]),
     )
 
     def fake_get_current_filings(**kwargs: object) -> list[SimpleNamespace]:
