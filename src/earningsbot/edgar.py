@@ -8,12 +8,16 @@ import logging
 import time
 from typing import TYPE_CHECKING, Protocol
 
+from earningsbot.limits import time_limit
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
 
 logger = logging.getLogger(__name__)
 
 EARNINGS_ITEM = "2.02"
+MAX_FAILURES = 3  # 🛑 A filing whose items cannot be read is skipped after this many failed lookups in a row.
+ITEMS_TIMEOUT_SECONDS = 45.0  # ⏱️ Wall-clock budget for one filing's items lookup.
 
 
 class SeenFilings(Protocol):
@@ -27,12 +31,12 @@ class SeenFilings(Protocol):
         """Record the accession number as handled."""
 
 
-class EightKReport(Protocol):
-    """🧩 The part of an edgartools EightK report this module reads."""
+class IndexHeaders(Protocol):
+    """🧩 The part of an edgartools IndexHeaders this module reads."""
 
     @property
     def items(self) -> list[str]:
-        """Return item labels such as ['Item 2.02', 'Item 9.01']."""
+        """Return bare item numbers such as ['2.02', '9.01']."""
 
 
 class Filing(Protocol):
@@ -58,8 +62,9 @@ class Filing(Protocol):
     def homepage_url(self) -> str:
         """Return the URL of the filing's index page."""
 
-    def obj(self) -> EightKReport:
-        """Fetch and parse the full filing. This costs one HTTP request."""
+    @property
+    def index_headers(self) -> IndexHeaders:
+        """Fetch and parse the index-headers page. This is one small HTTP request."""
 
 
 def is_earnings(items: list[str]) -> bool:
@@ -67,26 +72,69 @@ def is_earnings(items: list[str]) -> bool:
     return any(EARNINGS_ITEM in item for item in items)
 
 
+def index_header_items(filing: Filing) -> list[str]:
+    """Return item labels such as ['Item 2.02'] from the filing's index-headers page.
+
+    🪶 The index-headers page is a few KB. The full submission can be megabytes and
+    can stall, so this lookup never reads it. The page lists bare numbers, so the
+    "Item " prefix is added to match the labels that is_earnings reads.
+    """
+    return [f"Item {number}" for number in filing.index_headers.items]
+
+
+def _record_failure(filing: Filing, err: Exception, failures: dict[str, int], seen: SeenFilings) -> bool:
+    """Count one failed items lookup for ``filing``. Return True when the filing is skipped.
+
+    Below MAX_FAILURES the caller re-raises, which ends the cycle, and the lookup is
+    tried again next cycle. At MAX_FAILURES the filing joins ``seen`` and an ERROR is
+    logged, so the rest of the feed keeps moving. The count is cleared on skip.
+    """
+    accession_no = filing.accession_no
+    attempts = failures.get(accession_no, 0) + 1
+    if attempts < MAX_FAILURES:
+        failures[accession_no] = attempts
+        return False
+    failures.pop(accession_no, None)
+    logger.error(
+        "filing skipped after repeated failures",
+        extra={"accession_no": accession_no, "company": filing.company, "attempts": attempts, "error": repr(err)},
+    )
+    seen.add(accession_no)
+    return True
+
+
 def new_earnings_filings(
     filings: Iterable[Filing],
     seen: SeenFilings,
-    get_items: Callable[[Filing], list[str]] = lambda f: f.obj().items,
+    get_items: Callable[[Filing], list[str]] = index_header_items,
+    failures: dict[str, int] | None = None,
 ) -> Iterator[Filing]:
     """Yield unseen filings that report Item 2.02, in feed order.
 
-    Every unseen filing gets one items lookup. Lookup errors propagate to the
-    caller, and filings yielded before the error stay yielded. A failure ends
-    the cycle, so filings after the failing one wait for the next cycle. The SEC
-    feed is newest first, so older filings stuck behind a filing that keeps
-    failing can scroll off the page and be missed. A non-earnings
-    filing joins ``seen`` right away. An earnings filing joins ``seen`` only
-    after the caller asks for the next item, so a failed write is retried on
-    the next poll.
+    Every unseen filing gets one items lookup, limited to ITEMS_TIMEOUT_SECONDS. A
+    failed or timed-out lookup is one failed attempt for that accession. Below
+    MAX_FAILURES the error propagates, so the cycle ends and the lookup is tried
+    again next cycle. Filings yielded before the error stay yielded. At MAX_FAILURES
+    the filing joins ``seen``, an ERROR is logged, and the next filing is checked.
+    ``failures`` keeps the counts across cycles, so the caller passes in one dict for
+    the run. A successful lookup clears that accession's count.
+
+    A non-earnings filing joins ``seen`` right away. An earnings filing joins ``seen``
+    only after the caller asks for the next item, so a failed notify is retried on
+    the next poll. A notify failure is never counted here and never skips a filing.
     """
+    failures = {} if failures is None else failures
     for filing in filings:
         if filing.accession_no in seen:
             continue
-        items = get_items(filing)
+        try:
+            with time_limit(ITEMS_TIMEOUT_SECONDS):
+                items = get_items(filing)
+        except Exception as err:
+            if not _record_failure(filing, err, failures, seen):
+                raise
+            continue
+        failures.pop(filing.accession_no, None)
         if not is_earnings(items):
             logger.debug("filing skipped", extra={"accession_no": filing.accession_no, "items": items})
             seen.add(filing.accession_no)
@@ -123,20 +171,24 @@ def poll(  # noqa: PLR0913 - the spec fixes these injected dependencies as keywo
 
     ``notify`` gets each new earnings filing once. The caller owns ``seen``, so
     a filing already recorded there, even by an earlier run, is not notified
-    again. A failed cycle logs a warning and polling continues. A failure ends
-    the cycle, so filings after the failing one wait for the next cycle. The SEC
-    feed is newest first, so older filings stuck behind a filing that keeps
-    failing can scroll off the page and be missed. Returns True
-    when the single cycle in ``once`` mode succeeded, and False when it failed.
-    The loop never returns otherwise. Dependencies are injected so tests need
-    no network and no real sleeping.
+    again. A failed cycle logs a warning and polling continues.
+
+    Only items-lookup failures are counted. After MAX_FAILURES in a row for one
+    filing, that filing is skipped, marked seen, and logged at ERROR, so a filing
+    whose items cannot be read cannot block the feed. A failed notify, such as a
+    Discord outage, ends the cycle and is retried every cycle, and the filing is
+    never marked seen. Failure counts live in memory, so a restart starts them at
+    zero. Returns True when the single cycle in ``once`` mode succeeded, and False
+    when it failed. The loop never returns otherwise. Dependencies are injected so
+    tests need no network and no real sleeping.
     """
+    failures: dict[str, int] = {}
     while True:
         succeeded = True
         started = time.perf_counter()
         try:
             notified = 0
-            for filing in new_earnings_filings(fetch(), seen):
+            for filing in new_earnings_filings(fetch(), seen, failures=failures):
                 notify(filing)
                 notified += 1
             logger.info(

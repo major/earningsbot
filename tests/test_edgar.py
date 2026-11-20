@@ -2,11 +2,13 @@
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Self
 
 import pytest
 
+from earningsbot import edgar
 from earningsbot.edgar import format_filing, is_earnings, new_earnings_filings, poll
 from earningsbot.log_config import JsonFormatter
 
@@ -15,6 +17,10 @@ if TYPE_CHECKING:
 
 CYCLES_BEFORE_STOP = 3
 RETRY_CYCLES = 2
+FAILURE_LIMIT = 3
+SKIP_CYCLES = 4
+SCRIPT_CYCLES = 7
+NOTIFY_ATTEMPTS = 5
 EXPECTED_LINE = "2026-11-18  Acme Corp  CIK 320193  0001-26-000001  https://www.sec.gov/index.html"
 
 
@@ -32,6 +38,18 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
     return [record for record in _records(caplog) if record["level"] == "warning"]
 
 
+def _errors(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    """🧪 Return the captured records at ERROR level."""
+    return [record for record in _records(caplog) if record["level"] == "error"]
+
+
+@dataclass
+class FakeIndexHeaders:
+    """🧪 Stand-in for the index-headers page, which lists bare item numbers such as 2.02."""
+
+    items: list[str]
+
+
 @dataclass
 class FakeFiling:
     """🧪 Stand-in for an edgartools Filing with only the fields this module reads."""
@@ -46,6 +64,55 @@ class FakeFiling:
     def obj(self) -> Self:
         """🧪 Return self, since the fake's items play the role of the EightK report."""
         return self
+
+    @property
+    def index_headers(self) -> FakeIndexHeaders:
+        """🧪 Return the items without the "Item " prefix, as the index-headers page lists them."""
+        return FakeIndexHeaders(items=[item.removeprefix("Item ") for item in self.items])
+
+
+class _NoBodyFiling(FakeFiling):
+    """🧪 Filing whose full submission must never be read, as in the stuck production case."""
+
+    def obj(self) -> Self:
+        """🧪 Fail the test if the lookup falls back to the full submission."""
+        msg = "full submission must not be downloaded"
+        raise AssertionError(msg)
+
+
+class _TimingOutFiling(FakeFiling):
+    """🧪 Filing whose index-headers page fails with a timeout, as a stalled download does."""
+
+    @property
+    def index_headers(self) -> FakeIndexHeaders:
+        """🧪 Raise a timeout at once."""
+        msg = "SEC never answered"
+        raise TimeoutError(msg)
+
+
+class _HangingFiling(FakeFiling):
+    """🧪 Filing whose index-headers page takes longer than the limits the tests set."""
+
+    @property
+    def index_headers(self) -> FakeIndexHeaders:
+        """🧪 Block for a second before answering, so only the time limit can end the call early."""
+        time.sleep(1)
+        return super().index_headers
+
+
+@dataclass
+class _ScriptedFiling(FakeFiling):
+    """🧪 Filing whose successive lookups follow a script of "ok" and "fail" answers."""
+
+    lookups: list[str] = field(default_factory=list)
+
+    @property
+    def index_headers(self) -> FakeIndexHeaders:
+        """🧪 Answer the next scripted lookup, or time out when the script says so."""
+        if self.lookups.pop(0) == "fail":
+            msg = "SEC timed out"
+            raise TimeoutError(msg)
+        return super().index_headers
 
 
 @pytest.mark.parametrize(
@@ -217,3 +284,152 @@ def test_poll_retries_filing_when_notify_fails(caplog: pytest.LogCaptureFixture)
 
     assert attempts == [filing] * RETRY_CYCLES
     assert len(_warnings(caplog)) == 1
+
+
+def test_default_lookup_reads_index_headers_not_full_submission() -> None:
+    """The default lookup reads items from the small index-headers page and never calls obj()."""
+    earnings = _NoBodyFiling("0001-26-000001", items=["Item 2.02", "Item 9.01"])
+
+    result = list(new_earnings_filings([earnings], set()))
+
+    assert result == [earnings]
+
+
+@pytest.mark.parametrize(
+    ("items", "expected"),
+    [
+        (["Item 2.02", "Item 9.01"], True),
+        (["Item 1.01", "Item 9.01"], False),
+        ([], False),
+    ],
+)
+def test_index_header_items_work_with_is_earnings(items: list[str], *, expected: bool) -> None:
+    """Index-headers items pass through is_earnings the same way full-submission items did."""
+    filing = FakeFiling("0001-26-000001", items=items)
+
+    assert is_earnings(edgar.index_header_items(filing)) is expected
+
+
+def test_hung_items_lookup_warns_and_retries_next_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A hung items lookup ends the cycle with a warning, and the filing stays unseen for the next cycle."""
+    # Arrange
+    monkeypatch.setattr(edgar, "ITEMS_TIMEOUT_SECONDS", 0.05)
+    filing = _HangingFiling("0001-26-000001", items=["Item 2.02"])
+    notified: list[Filing] = []
+    sleeps: list[float] = []
+    seen: set[str] = set()
+
+    def sleep(seconds: float) -> None:
+        """🧪 Record the pause and stop after the second cycle."""
+        sleeps.append(seconds)
+        if len(sleeps) == RETRY_CYCLES:
+            raise _StopPolling
+
+    # Act
+    with pytest.raises(_StopPolling):
+        poll(fetch=lambda: [filing], notify=notified.append, sleep=sleep, seen=seen, interval=5.0, once=False)
+
+    # Assert
+    warnings = _warnings(caplog)
+    assert [record["msg"] for record in warnings] == ["poll cycle failed"] * RETRY_CYCLES
+    assert all("TimeoutError" in record["error"] for record in warnings)
+    assert seen == set()
+    assert notified == []
+
+
+def test_poll_skips_filing_after_three_failed_lookups(caplog: pytest.LogCaptureFixture) -> None:
+    """After three failed lookups, the filing is marked seen with an ERROR, and the next filing is still notified."""
+    # Arrange
+    poison = _TimingOutFiling("0001-26-000001", items=["Item 2.02"])
+    good = FakeFiling("0001-26-000002", items=["Item 2.02"])
+    notified: list[Filing] = []
+    sleeps: list[float] = []
+    seen: set[str] = set()
+
+    def sleep(seconds: float) -> None:
+        """🧪 Record the pause and stop after the cycle that skips the poison filing."""
+        sleeps.append(seconds)
+        if len(sleeps) == SKIP_CYCLES:
+            raise _StopPolling
+
+    # Act
+    with pytest.raises(_StopPolling):
+        poll(fetch=lambda: [poison, good], notify=notified.append, sleep=sleep, seen=seen, interval=5.0, once=False)
+
+    # Assert
+    assert notified == [good]
+    assert seen == {poison.accession_no, good.accession_no}
+    assert len(_warnings(caplog)) == FAILURE_LIMIT - 1
+    errors = _errors(caplog)
+    assert [(record["msg"], record["accession_no"], record["attempts"]) for record in errors] == [
+        ("filing skipped after repeated failures", poison.accession_no, FAILURE_LIMIT),
+    ]
+    assert "TimeoutError" in errors[0]["error"]
+
+
+def test_poll_resets_count_on_success_and_counts_each_filing_apart(caplog: pytest.LogCaptureFixture) -> None:
+    """A success clears that filing's count, and one filing's failures never count toward another's."""
+    # Arrange: "fail, fail, ok (notify rejected), fail, ok" for the first filing, and always fail for the second
+    filing = _ScriptedFiling("0001-26-000001", items=["Item 2.02"], lookups=["fail", "fail", "ok", "fail", "ok"])
+    other = _TimingOutFiling("0001-26-000002", items=["Item 2.02"])
+    notify_rejects = [True, False]
+    notified: list[Filing] = []
+    sleeps: list[float] = []
+    seen: set[str] = set()
+
+    def notify(item: Filing) -> None:
+        """🧪 Reject the first notify, which follows the lookup that succeeds in cycle 3, then accept."""
+        if notify_rejects.pop(0):
+            msg = "webhook rejected"
+            raise OSError(msg)
+        notified.append(item)
+
+    def sleep(seconds: float) -> None:
+        """🧪 Record the pause and stop after the scripted cycles."""
+        sleeps.append(seconds)
+        if len(sleeps) == SCRIPT_CYCLES:
+            raise _StopPolling
+
+    # Act
+    with pytest.raises(_StopPolling):
+        poll(fetch=lambda: [filing, other], notify=notify, sleep=sleep, seen=seen, interval=5.0, once=False)
+
+    # Assert
+    assert notified == [filing]
+    assert seen == {filing.accession_no, other.accession_no}
+    errors = _errors(caplog)
+    assert [(record["accession_no"], record["attempts"]) for record in errors] == [(other.accession_no, FAILURE_LIMIT)]
+    assert len(_warnings(caplog)) == SCRIPT_CYCLES - 1
+
+
+def test_failed_notify_never_marks_filing_seen(caplog: pytest.LogCaptureFixture) -> None:
+    """A filing whose notify keeps failing stays unseen with no skip and no ERROR, and once=True still returns False."""
+    # Arrange
+    filing = FakeFiling("0001-26-000001", items=["Item 2.02"])
+    sleeps: list[float] = []
+    seen: set[str] = set()
+
+    def notify(_filing: Filing) -> None:
+        """🧪 Reject every notify."""
+        msg = "webhook rejected"
+        raise OSError(msg)
+
+    def sleep(seconds: float) -> None:
+        """🧪 Record the pause and stop after the fifth failed cycle."""
+        sleeps.append(seconds)
+        if len(sleeps) == NOTIFY_ATTEMPTS:
+            raise _StopPolling
+
+    # Act
+    with pytest.raises(_StopPolling):
+        poll(fetch=lambda: [filing], notify=notify, sleep=sleep, seen=seen, interval=5.0, once=False)
+    succeeded = poll(fetch=lambda: [filing], notify=notify, sleep=sleeps.append, seen=seen, interval=5.0, once=True)
+
+    # Assert
+    assert succeeded is False
+    assert seen == set()
+    assert len(_warnings(caplog)) == NOTIFY_ATTEMPTS + 1
+    assert _errors(caplog) == []
