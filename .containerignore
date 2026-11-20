@@ -1,0 +1,23 @@
+# 🙈 Keep the build context small and free of secrets.
+
+# Version control and worktrees
+.git
+.worktrees
+
+# Local environments and state
+.venv
+.earningsbot
+.env*
+
+# Caches and coverage output
+**/__pycache__
+.pytest_cache
+.ruff_cache
+.coverage*
+htmlcov
+
+# Files the image does not need
+tests/
+Containerfile
+.containerignore
+Makefile
