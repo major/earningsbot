@@ -5,6 +5,7 @@
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, NotRequired, TypedDict
@@ -24,8 +25,9 @@ logger = logging.getLogger(__name__)
 
 _TITLE_LIMIT = 256
 _WEBHOOK_TIMEOUT_SECONDS = 10.0
-# ⏱️ A full-submission download can take minutes on a slow day. Past this, the alert posts without metrics.
-METRICS_TIMEOUT_SECONDS = 180.0
+# ⏱️ The poll loop is synchronous, so slow metrics would stall polling for every filing behind them.
+# Past this limit, the alert posts without numbers.
+METRICS_TIMEOUT_SECONDS = 90.0
 _EARNINGS_DESCRIPTION = "📄 Earnings release filed"
 _INVALID_WEBHOOK = "build webhook request: invalid webhook URL"
 # 🔁 Besides 5xx, these 4xx codes mean "try again later", so they are retried.
@@ -174,14 +176,24 @@ def _metrics_or_empty(
 ) -> Metrics:
     """Return the filing's metrics, or empty Metrics when the lookup fails or runs past METRICS_TIMEOUT_SECONDS."""
     # 🛟 Metrics are a bonus, so an extraction failure or a slow download must never block the alert.
+    started = time.perf_counter()
     try:
         with time_limit(METRICS_TIMEOUT_SECONDS):
-            return get_metrics(filing)
+            metrics = get_metrics(filing)
     except Exception as err:  # noqa: BLE001 - any failure falls back to the basic alert
         logger.warning(
             "metrics lookup failed", extra={"accession_no": filing.accession_no, "error": type(err).__name__}
         )
         return Metrics()
+    # 📈 Durations from successful lookups let p50 and p95 be read from production logs.
+    logger.info(
+        "metrics lookup finished",
+        extra={
+            "accession_no": filing.accession_no,
+            "duration_ms": round((time.perf_counter() - started) * 1000),
+        },
+    )
+    return metrics
 
 
 def _ticker_or_empty(cik: int, lookup_ticker: Callable[[int | str], object]) -> str:

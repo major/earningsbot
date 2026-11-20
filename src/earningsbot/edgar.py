@@ -6,6 +6,7 @@ request to read its items.
 
 import logging
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from earningsbot.limits import time_limit
@@ -16,7 +17,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 EARNINGS_ITEM = "2.02"
-MAX_FAILURES = 3  # 🛑 A filing whose items cannot be read is skipped after this many failed lookups in a row.
+MAX_FAILURES = 3  # 🛑 A filing whose items cannot be read is skipped once it has this many strikes.
+MIN_FAILURE_SPAN_SECONDS = 1800.0  # ⏳ Strikes must also span this long, so a briefly missing page is spared.
+OUTAGE_STREAK = 2  # 🌩️ This many misses in a row in one cycle look like an outage, so that cycle counts no strikes.
 ITEMS_TIMEOUT_SECONDS = 45.0  # ⏱️ Wall-clock budget for one filing's items lookup.
 
 
@@ -82,48 +85,80 @@ def index_header_items(filing: Filing) -> list[str]:
     return [f"Item {number}" for number in filing.index_headers.items]
 
 
-def _record_failure(filing: Filing, err: Exception, failures: dict[str, int], seen: SeenFilings) -> bool:
-    """Count one failed items lookup for ``filing``. Return True when the filing is skipped.
+@dataclass
+class _Strikes:
+    """🧾 Failed items lookups for one filing, and the clock time of its first strike."""
 
-    Below MAX_FAILURES the caller re-raises, which ends the cycle, and the lookup is
-    tried again next cycle. At MAX_FAILURES the filing joins ``seen`` and an ERROR is
-    logged, so the rest of the feed keeps moving. The count is cleared on skip.
+    count: int
+    first_strike: float
+
+
+def _now() -> float:
+    """⏳ Return the monotonic clock in seconds. Tests patch this to move time without sleeping."""
+    return time.monotonic()
+
+
+def _record_strikes(
+    misses: list[tuple[Filing, Exception]],
+    failures: dict[str, _Strikes],
+    seen: SeenFilings,
+) -> None:
+    """Add one strike for each failed filing, and skip a filing that has reached the limit.
+
+    A filing is skipped only when it has MAX_FAILURES strikes and they span at least
+    MIN_FAILURE_SPAN_SECONDS. A skipped filing joins ``seen``, its count is cleared,
+    and an ERROR is logged.
     """
-    accession_no = filing.accession_no
-    attempts = failures.get(accession_no, 0) + 1
-    if attempts < MAX_FAILURES:
-        failures[accession_no] = attempts
-        return False
-    failures.pop(accession_no, None)
-    logger.error(
-        "filing skipped after repeated failures",
-        extra={"accession_no": accession_no, "company": filing.company, "attempts": attempts, "error": repr(err)},
-    )
-    seen.add(accession_no)
-    return True
+    now = _now()
+    for filing, err in misses:
+        accession_no = filing.accession_no
+        strikes = failures.setdefault(accession_no, _Strikes(count=0, first_strike=now))
+        strikes.count += 1
+        if strikes.count < MAX_FAILURES or now - strikes.first_strike < MIN_FAILURE_SPAN_SECONDS:
+            continue
+        failures.pop(accession_no)
+        logger.error(
+            "filing skipped after repeated failures",
+            extra={
+                "accession_no": accession_no,
+                "company": filing.company,
+                "attempts": strikes.count,
+                "error": repr(err),
+            },
+        )
+        seen.add(accession_no)
 
 
 def new_earnings_filings(
     filings: Iterable[Filing],
     seen: SeenFilings,
     get_items: Callable[[Filing], list[str]] = index_header_items,
-    failures: dict[str, int] | None = None,
+    failures: dict[str, _Strikes] | None = None,
 ) -> Iterator[Filing]:
     """Yield unseen filings that report Item 2.02, in feed order.
 
     Every unseen filing gets one items lookup, limited to ITEMS_TIMEOUT_SECONDS. A
-    failed or timed-out lookup is one failed attempt for that accession. Below
-    MAX_FAILURES the error propagates, so the cycle ends and the lookup is tried
-    again next cycle. Filings yielded before the error stay yielded. At MAX_FAILURES
-    the filing joins ``seen``, an ERROR is logged, and the next filing is checked.
-    ``failures`` keeps the counts across cycles, so the caller passes in one dict for
-    the run. A successful lookup clears that accession's count.
+    failed lookup does not end the cycle, so later filings are still checked. Two
+    failed lookups in a row end the cycle with the error, and that cycle counts no
+    strikes, since SEC looks down. Otherwise, the cycle ends with the last error when
+    any lookup failed, and each failed filing gets a strike only if another lookup
+    succeeded in the same cycle. That tells a stuck filing apart from an outage. A
+    filing with MAX_FAILURES strikes spanning MIN_FAILURE_SPAN_SECONDS joins ``seen``
+    and gets an ERROR. A filing that is the only unseen one never gets strikes.
+    Filings yielded before an error stay yielded.
+
+    ``failures`` keeps the strikes across cycles, so the caller passes in one dict for
+    the run. A successful lookup clears that accession's strikes. A cycle cut short by
+    a notify failure applies no strikes, because the generator is never resumed.
 
     A non-earnings filing joins ``seen`` right away. An earnings filing joins ``seen``
     only after the caller asks for the next item, so a failed notify is retried on
     the next poll. A notify failure is never counted here and never skips a filing.
     """
     failures = {} if failures is None else failures
+    misses: list[tuple[Filing, Exception]] = []
+    streak = 0
+    found_any = False
     for filing in filings:
         if filing.accession_no in seen:
             continue
@@ -131,9 +166,14 @@ def new_earnings_filings(
             with time_limit(ITEMS_TIMEOUT_SECONDS):
                 items = get_items(filing)
         except Exception as err:
-            if not _record_failure(filing, err, failures, seen):
+            misses.append((filing, err))
+            streak += 1
+            if streak >= OUTAGE_STREAK:
+                # 🌩️ Two misses in a row look like an outage, so the strikes for this cycle are dropped.
                 raise
             continue
+        streak = 0
+        found_any = True
         failures.pop(filing.accession_no, None)
         if not is_earnings(items):
             logger.debug("filing skipped", extra={"accession_no": filing.accession_no, "items": items})
@@ -151,6 +191,11 @@ def new_earnings_filings(
         # 🔁 Add after the yield: the caller resumes us only once its write worked.
         yield filing
         seen.add(filing.accession_no)
+    if misses and found_any:
+        # 🧾 Strikes come last, so a cycle that an outage cut short never reaches this line.
+        _record_strikes(misses, failures, seen)
+    if misses:
+        raise misses[-1][1]
 
 
 def format_filing(filing: Filing) -> str:
@@ -173,16 +218,17 @@ def poll(  # noqa: PLR0913 - the spec fixes these injected dependencies as keywo
     a filing already recorded there, even by an earlier run, is not notified
     again. A failed cycle logs a warning and polling continues.
 
-    Only items-lookup failures are counted. After MAX_FAILURES in a row for one
-    filing, that filing is skipped, marked seen, and logged at ERROR, so a filing
-    whose items cannot be read cannot block the feed. A failed notify, such as a
-    Discord outage, ends the cycle and is retried every cycle, and the filing is
-    never marked seen. Failure counts live in memory, so a restart starts them at
-    zero. Returns True when the single cycle in ``once`` mode succeeded, and False
-    when it failed. The loop never returns otherwise. Dependencies are injected so
-    tests need no network and no real sleeping.
+    Only items-lookup failures are counted, as strikes. A filing with MAX_FAILURES
+    strikes spanning MIN_FAILURE_SPAN_SECONDS is skipped, marked seen, and logged at
+    ERROR, so a filing whose items cannot be read cannot block the feed for long. A
+    cycle with two failed lookups in a row is an outage and counts no strikes. A
+    failed notify, such as a Discord outage, ends the cycle and is retried every
+    cycle, and the filing is never marked seen. Strikes live in memory, so a restart
+    starts them at zero. Returns True when the single cycle in ``once`` mode
+    succeeded, and False when it failed. The loop never returns otherwise.
+    Dependencies are injected so tests need no network and no real sleeping.
     """
-    failures: dict[str, int] = {}
+    failures: dict[str, _Strikes] = {}
     while True:
         succeeded = True
         started = time.perf_counter()

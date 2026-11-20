@@ -19,6 +19,8 @@ CYCLES_BEFORE_STOP = 3
 RETRY_CYCLES = 2
 FAILURE_LIMIT = 3
 SKIP_CYCLES = 4
+LONE_CYCLES = 5
+WARNED_CYCLES = 4  # 🧾 Cycles 1, 2, 3 (a rejected notify), and 4 (a skip) each end with a warning
 SCRIPT_CYCLES = 7
 NOTIFY_ATTEMPTS = 5
 EXPECTED_LINE = "2026-11-18  Acme Corp  CIK 320193  0001-26-000001  https://www.sec.gov/index.html"
@@ -171,6 +173,57 @@ def test_new_earnings_filings_keeps_earlier_results_when_lookup_fails() -> None:
     with pytest.raises(TimeoutError, match="SEC timed out"):
         next(results)
     assert seen == {"0001-26-000001"}
+
+
+def test_failed_lookup_does_not_end_the_cycle() -> None:
+    """A failed lookup gets a strike, but the next filing is still yielded, and the cycle still ends with the error."""
+    # Arrange
+    pill = FakeFiling("0001-26-000001")
+    good = FakeFiling("0001-26-000002", items=["Item 2.02"])
+    seen: set[str] = set()
+    failures: dict[str, Any] = {}
+
+    def get_items(filing: Filing) -> list[str]:
+        """🧪 Time out on the pill and return Item 2.02 for the good filing."""
+        if filing is pill:
+            msg = "SEC timed out"
+            raise TimeoutError(msg)
+        return ["Item 2.02"]
+
+    results = new_earnings_filings([pill, good], seen, get_items, failures=failures)
+
+    # Act and assert: the good filing comes out, then the cycle ends with the pill's error
+    assert next(results) == good
+    with pytest.raises(TimeoutError, match="SEC timed out"):
+        next(results)
+    assert seen == {good.accession_no}
+    assert failures[pill.accession_no].count == 1
+
+
+def test_two_failed_lookups_in_a_row_end_the_cycle_without_strikes() -> None:
+    """Two misses in a row look like an outage: the cycle stops at the second, and it counts no strikes."""
+    # Arrange
+    first = FakeFiling("0001-26-000001")
+    second = FakeFiling("0001-26-000002")
+    later = FakeFiling("0001-26-000003", items=["Item 2.02"])
+    seen: set[str] = set()
+    failures: dict[str, Any] = {}
+    looked_up: list[str] = []
+
+    def get_items(filing: Filing) -> list[str]:
+        """🧪 Record each lookup, and time out on every one."""
+        looked_up.append(filing.accession_no)
+        msg = "SEC timed out"
+        raise TimeoutError(msg)
+
+    # Act
+    with pytest.raises(TimeoutError, match="SEC timed out"):
+        list(new_earnings_filings([first, second, later], seen, get_items, failures=failures))
+
+    # Assert
+    assert looked_up == [first.accession_no, second.accession_no]
+    assert failures == {}
+    assert seen == set()
 
 
 def test_format_filing() -> None:
@@ -340,45 +393,67 @@ def test_hung_items_lookup_warns_and_retries_next_cycle(
     assert notified == []
 
 
-def test_poll_skips_filing_after_three_failed_lookups(caplog: pytest.LogCaptureFixture) -> None:
-    """After three failed lookups, the filing is marked seen with an ERROR, and the next filing is still notified."""
-    # Arrange
+def test_poll_skips_filing_only_after_strikes_span_the_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Three strikes inside the span limit keep the filing unseen. A strike past the span skips it with an ERROR."""
+    # Arrange: the clock moves 600 s per cycle, so strikes land at 0, 600, 1200, and 1800 seconds
+    clock = [0.0]
+    monkeypatch.setattr(edgar, "_now", lambda: clock[0])
     poison = _TimingOutFiling("0001-26-000001", items=["Item 2.02"])
-    good = FakeFiling("0001-26-000002", items=["Item 2.02"])
     notified: list[Filing] = []
     sleeps: list[float] = []
     seen: set[str] = set()
+    skipped_after_cycle: list[bool] = []
+
+    def fetch() -> list[FakeFiling]:
+        """🧪 Return the poison filing and one new non-earnings filing, so each cycle has a success."""
+        return [poison, FakeFiling(f"0002-26-{len(sleeps):06d}", items=["Item 9.01"])]
 
     def sleep(seconds: float) -> None:
-        """🧪 Record the pause and stop after the cycle that skips the poison filing."""
+        """🧪 Move the clock, record whether the poison filing is skipped yet, and stop after four cycles."""
+        clock[0] += 600.0
         sleeps.append(seconds)
+        skipped_after_cycle.append(poison.accession_no in seen)
         if len(sleeps) == SKIP_CYCLES:
             raise _StopPolling
 
     # Act
     with pytest.raises(_StopPolling):
-        poll(fetch=lambda: [poison, good], notify=notified.append, sleep=sleep, seen=seen, interval=5.0, once=False)
+        poll(fetch=fetch, notify=notified.append, sleep=sleep, seen=seen, interval=5.0, once=False)
 
     # Assert
-    assert notified == [good]
-    assert seen == {poison.accession_no, good.accession_no}
-    assert len(_warnings(caplog)) == FAILURE_LIMIT - 1
+    assert skipped_after_cycle == [False, False, False, True]
+    assert notified == []
+    assert len(_warnings(caplog)) == SKIP_CYCLES
     errors = _errors(caplog)
+    # 🧾 The fourth strike is the one that lands past the span, so attempts is 4
     assert [(record["msg"], record["accession_no"], record["attempts"]) for record in errors] == [
-        ("filing skipped after repeated failures", poison.accession_no, FAILURE_LIMIT),
+        ("filing skipped after repeated failures", poison.accession_no, 4),
     ]
     assert "TimeoutError" in errors[0]["error"]
 
 
-def test_poll_resets_count_on_success_and_counts_each_filing_apart(caplog: pytest.LogCaptureFixture) -> None:
-    """A success clears that filing's count, and one filing's failures never count toward another's."""
-    # Arrange: "fail, fail, ok (notify rejected), fail, ok" for the first filing, and always fail for the second
+def test_poll_resets_count_on_success_and_counts_each_filing_apart(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A success clears that filing's strikes, and one filing's failures never count toward another's."""
+    # Arrange: "fail, fail, ok (notify rejected), fail, ok" for the first filing, and always fail for the second.
+    # Each cycle also has a fresh non-earnings filing that succeeds, so the strikes are not dropped as an outage.
+    clock = [0.0]
+    monkeypatch.setattr(edgar, "_now", lambda: clock[0])
     filing = _ScriptedFiling("0001-26-000001", items=["Item 2.02"], lookups=["fail", "fail", "ok", "fail", "ok"])
     other = _TimingOutFiling("0001-26-000002", items=["Item 2.02"])
     notify_rejects = [True, False]
     notified: list[Filing] = []
     sleeps: list[float] = []
     seen: set[str] = set()
+
+    def fetch() -> list[Filing]:
+        """🧪 Return the scripted filing, a fresh success, then the always-failing filing."""
+        return [filing, FakeFiling(f"0002-26-{len(sleeps):06d}", items=["Item 9.01"]), other]
 
     def notify(item: Filing) -> None:
         """🧪 Reject the first notify, which follows the lookup that succeeds in cycle 3, then accept."""
@@ -388,21 +463,53 @@ def test_poll_resets_count_on_success_and_counts_each_filing_apart(caplog: pytes
         notified.append(item)
 
     def sleep(seconds: float) -> None:
-        """🧪 Record the pause and stop after the scripted cycles."""
+        """🧪 Move the clock 600 s per cycle, and stop after the scripted cycles."""
+        clock[0] += 600.0
         sleeps.append(seconds)
         if len(sleeps) == SCRIPT_CYCLES:
             raise _StopPolling
 
     # Act
     with pytest.raises(_StopPolling):
-        poll(fetch=lambda: [filing, other], notify=notify, sleep=sleep, seen=seen, interval=5.0, once=False)
+        poll(fetch=fetch, notify=notify, sleep=sleep, seen=seen, interval=5.0, once=False)
 
     # Assert
     assert notified == [filing]
-    assert seen == {filing.accession_no, other.accession_no}
+    assert {filing.accession_no, other.accession_no} <= seen
     errors = _errors(caplog)
     assert [(record["accession_no"], record["attempts"]) for record in errors] == [(other.accession_no, FAILURE_LIMIT)]
-    assert len(_warnings(caplog)) == SCRIPT_CYCLES - 1
+    assert len(_warnings(caplog)) == WARNED_CYCLES
+
+
+def test_lone_failing_filing_never_collects_strikes(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A filing that is the only unseen one never collects strikes, so it is never skipped, however long it fails."""
+    # Arrange: 900 s per cycle, so the span limit would pass if strikes were counted
+    clock = [0.0]
+    monkeypatch.setattr(edgar, "_now", lambda: clock[0])
+    lone = _TimingOutFiling("0001-26-000001", items=["Item 2.02"])
+    notified: list[Filing] = []
+    sleeps: list[float] = []
+    seen: set[str] = set()
+
+    def sleep(seconds: float) -> None:
+        """🧪 Move the clock, and stop after the fixed number of cycles."""
+        clock[0] += 900.0
+        sleeps.append(seconds)
+        if len(sleeps) == LONE_CYCLES:
+            raise _StopPolling
+
+    # Act
+    with pytest.raises(_StopPolling):
+        poll(fetch=lambda: [lone], notify=notified.append, sleep=sleep, seen=seen, interval=5.0, once=False)
+
+    # Assert
+    assert seen == set()
+    assert notified == []
+    assert _errors(caplog) == []
+    assert len(_warnings(caplog)) == LONE_CYCLES
 
 
 def test_failed_notify_never_marks_filing_seen(caplog: pytest.LogCaptureFixture) -> None:
