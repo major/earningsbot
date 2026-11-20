@@ -4,10 +4,14 @@
 request to read its items.
 """
 
+import logging
+import time
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
+
+logger = logging.getLogger(__name__)
 
 EARNINGS_ITEM = "2.02"
 
@@ -84,8 +88,18 @@ def new_earnings_filings(
             continue
         items = get_items(filing)
         if not is_earnings(items):
+            logger.debug("filing skipped", extra={"accession_no": filing.accession_no, "items": items})
             seen.add(filing.accession_no)
             continue
+        logger.info(
+            "earnings filing found",
+            extra={
+                "accession_no": filing.accession_no,
+                "company": filing.company,
+                "cik": filing.cik,
+                "filing_date": filing.filing_date,
+            },
+        )
         # 🔁 Add after the yield: the caller resumes us only once its write worked.
         yield filing
         seen.add(filing.accession_no)
@@ -99,7 +113,6 @@ def format_filing(filing: Filing) -> str:
 def poll(  # noqa: PLR0913 - the spec fixes these injected dependencies as keywords
     fetch: Callable[[], Iterable[Filing]],
     notify: Callable[[Filing], object],
-    warn: Callable[[str], object],
     sleep: Callable[[float], object],
     *,
     seen: SeenFilings,
@@ -110,21 +123,28 @@ def poll(  # noqa: PLR0913 - the spec fixes these injected dependencies as keywo
 
     ``notify`` gets each new earnings filing once. The caller owns ``seen``, so
     a filing already recorded there, even by an earlier run, is not notified
-    again. A failed cycle calls ``warn`` and polling continues. A failure ends
+    again. A failed cycle logs a warning and polling continues. A failure ends
     the cycle, so filings after the failing one wait for the next cycle. The SEC
     feed is newest first, so older filings stuck behind a filing that keeps
     failing can scroll off the page and be missed. Returns True
-    when the single cycle in ``once`` mode succeeded, and False when it warned.
+    when the single cycle in ``once`` mode succeeded, and False when it failed.
     The loop never returns otherwise. Dependencies are injected so tests need
     no network and no real sleeping.
     """
     while True:
         succeeded = True
+        started = time.perf_counter()
         try:
+            notified = 0
             for filing in new_earnings_filings(fetch(), seen):
                 notify(filing)
+                notified += 1
+            logger.info(
+                "poll cycle finished",
+                extra={"earnings": notified, "duration_ms": round((time.perf_counter() - started) * 1000)},
+            )
         except Exception as err:  # noqa: BLE001 - one bad cycle must not stop the poller
-            warn(f"poll cycle failed: {err!r}")
+            logger.warning("poll cycle failed", extra={"error": repr(err)})
             succeeded = False
         if once:
             return succeeded

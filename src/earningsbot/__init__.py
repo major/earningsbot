@@ -15,6 +15,7 @@ from edgar.reference.tickers import find_ticker
 
 from earningsbot.discord import notify_discord
 from earningsbot.edgar import format_filing, poll
+from earningsbot.log_config import configure_logging
 from earningsbot.metrics import fetch_metrics
 from earningsbot.state import SeenStore
 
@@ -23,11 +24,15 @@ if TYPE_CHECKING:
 
     from earningsbot.edgar import Filing
 
+logger = logging.getLogger(__name__)
+
 IDENTITY_ENV = "EDGAR_IDENTITY"
 STATE_ENV = "EARNINGSBOT_STATE_PATH"
 WEBHOOKS_ENV = "DISCORD_EARNINGS_WEBHOOKS"
+LOG_LEVEL_ENV = "EARNINGSBOT_LOG_LEVEL"
 STOCK_LOGO_ENV = "STOCK_LOGO"
 TRANSPARENT_PNG_ENV = "TRANSPARENT_PNG"
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 DEFAULT_STATE_PATH = ".earningsbot/seen.sqlite3"
 DEFAULT_STOCK_LOGO = "https://static.stocktitan.net/company-logo/%s.webp"
 DEFAULT_TRANSPARENT_PNG = "https://major.io/transparent.png"
@@ -39,11 +44,6 @@ def _emit(text: str) -> None:
     # 🚰 Flushing matters when the output goes into a pipe.
     sys.stdout.write(text)
     sys.stdout.flush()
-
-
-def _warn(message: str) -> None:
-    """Write one warning line to stderr."""
-    sys.stderr.write(message + "\n")
 
 
 def _notify(filing: Filing) -> None:
@@ -60,6 +60,17 @@ def _state_path() -> Path:
 def _setting(name: str, default: str) -> str:
     """Return a setting from the environment, or the default when unset or blank."""
     return os.environ.get(name, "").strip() or default
+
+
+def _log_level() -> str:
+    """Return the log level from the environment, or INFO when unset or blank."""
+    # 🔤 Case does not matter, so "debug" and "DEBUG" both work.
+    level = _setting(LOG_LEVEL_ENV, "INFO").upper()
+    if level not in LOG_LEVELS:
+        names = ", ".join(LOG_LEVELS)
+        sys.stderr.write(f"error: {LOG_LEVEL_ENV} must be one of {names}\n")
+        raise SystemExit(USAGE_EXIT_CODE)
+    return level
 
 
 def _webhook_urls(raw: str) -> list[str]:
@@ -95,7 +106,6 @@ def _require_http_urls(webhooks: list[str]) -> None:
 def _discord_notifier(
     client: httpx2.Client,
     webhooks: list[str],
-    warn: Callable[[str], object],
 ) -> Callable[[Filing], None]:
     """Return a notifier that prints each filing, then posts it to Discord."""
     stock_logo = _setting(STOCK_LOGO_ENV, DEFAULT_STOCK_LOGO)
@@ -111,7 +121,6 @@ def _discord_notifier(
             webhooks=webhooks,
             stock_logo=stock_logo,
             transparent_png=transparent_png,
-            warn=warn,
             lookup_ticker=find_ticker,
             # 📊 Passed in like find_ticker, so tests can patch it in this module.
             get_metrics=fetch_metrics,
@@ -141,21 +150,32 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(USAGE_EXIT_CODE)
 
     set_identity(identity)
-    # 🔇 httpx2 logs full request URLs at INFO, and those URLs carry the webhook tokens.
-    logging.getLogger("httpx2").setLevel(logging.WARNING)
+    # 🧾 Checked before any polling, so a bad level never starts a run.
+    level = _log_level()
+    configure_logging(level)
     webhooks = _webhook_urls(os.environ.get(WEBHOOKS_ENV, ""))
     _require_http_urls(webhooks)
+    state_path = _state_path()
+    logger.info(
+        "starting",
+        extra={
+            "interval": args.interval,
+            "once": args.once,
+            "webhooks": len(webhooks),
+            "state_path": str(state_path),
+            "log_level": level,
+        },
+    )
     with ExitStack() as stack:
-        seen = stack.enter_context(closing(SeenStore(_state_path())))
+        seen = stack.enter_context(closing(SeenStore(state_path)))
         notify: Callable[[Filing], None] = _notify
         if webhooks:
             # 🌐 One client serves the whole run, and the stack closes it on any exit.
             client = stack.enter_context(closing(httpx2.Client()))
-            notify = _discord_notifier(client, webhooks, _warn)
+            notify = _discord_notifier(client, webhooks)
         succeeded = poll(
             fetch=lambda: get_current_filings(form="8-K", page_size=100),
             notify=notify,
-            warn=_warn,
             sleep=time.sleep,
             seen=seen,
             interval=args.interval,

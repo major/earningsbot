@@ -4,7 +4,7 @@ import functools
 import json
 import logging
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx2
 import pytest
@@ -20,10 +20,17 @@ if TYPE_CHECKING:
 IDENTITY_ENV = "EDGAR_IDENTITY"
 STATE_ENV = "EARNINGSBOT_STATE_PATH"
 WEBHOOKS_ENV = "DISCORD_EARNINGS_WEBHOOKS"
+LOG_LEVEL_ENV = "EARNINGSBOT_LOG_LEVEL"
+WEBHOOK_URL = "https://discord.example/api/webhooks/1/secret-token"
 USAGE_EXIT_CODE = 2
 FAILED_CYCLE_EXIT_CODE = 1
 RETRY_POST_COUNT = 2
 EXPECTED_LINE = "2026-11-18  Acme Corp  CIK 320193  0001-26-000001  https://www.sec.gov/index.html\n"
+
+
+def _records(text: str) -> list[dict[str, Any]]:
+    """🧪 Parse each stderr line as one JSON log record. Any other line fails the test."""
+    return [json.loads(line) for line in text.splitlines()]
 
 
 @pytest.fixture(autouse=True)
@@ -259,11 +266,14 @@ def test_main_permanent_webhook_failure_does_not_repeat(
     second = capsys.readouterr()
 
     # Assert
+    skipped = [record for record in _records(first.err) if record["msg"] == "webhook skipped"]
     assert first.out == EXPECTED_LINE
-    assert "webhook 2: post webhook: unexpected status 404; skipped for this filing" in first.err
+    assert [(record["webhook"], record["reason"]) for record in skipped] == [
+        (2, "post webhook: unexpected status 404"),
+    ]
     assert [str(post.url) for post in posts] == ["https://a/x", "https://b/y"]
     assert second.out == ""
-    assert second.err == ""
+    assert {record["level"] for record in _records(second.err)} == {"info"}
 
 
 @pytest.mark.usefixtures("identities", "feed")
@@ -288,4 +298,73 @@ def test_main_discord_failure_retries_next_run(
     assert "unexpected status 500" in first.err
     assert len(posts) == RETRY_POST_COUNT
     assert second.out == EXPECTED_LINE
-    assert second.err == ""
+    assert {record["level"] for record in _records(second.err)} == {"info"}
+
+
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [
+        pytest.param(None, logging.INFO, id="unset"),
+        pytest.param("", logging.INFO, id="blank"),
+        pytest.param("   ", logging.INFO, id="spaces"),
+        pytest.param("debug", logging.DEBUG, id="lowercase"),
+        pytest.param(" Error ", logging.ERROR, id="mixed-case-padded"),
+    ],
+)
+@pytest.mark.usefixtures("identities", "feed")
+def test_main_reads_log_level_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str | None,
+    expected: int,
+) -> None:
+    """EARNINGSBOT_LOG_LEVEL sets the root level. Unset or blank means INFO, and case does not matter."""
+    if env_value is None:
+        monkeypatch.delenv(LOG_LEVEL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(LOG_LEVEL_ENV, env_value)
+
+    main(["--once"])
+
+    assert logging.getLogger().level == expected
+
+
+@pytest.mark.usefixtures("identities")
+def test_main_exits_2_on_invalid_log_level(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    feed: list[dict[str, object]],
+) -> None:
+    """An unknown log level is a usage error: exit 2 with one plain line, and no polling."""
+    monkeypatch.setenv(LOG_LEVEL_ENV, "verbose")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--once"])
+
+    assert exc_info.value.code == USAGE_EXIT_CODE
+    assert capsys.readouterr().err == (
+        "error: EARNINGSBOT_LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL\n"
+    )
+    assert feed == []
+
+
+@pytest.mark.usefixtures("identities", "feed")
+def test_main_once_logs_json_lines_without_webhook_urls(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Stderr holds only JSON log lines for the poll events, and no webhook URL or token appears."""
+    # Arrange
+    monkeypatch.setenv(WEBHOOKS_ENV, WEBHOOK_URL)
+    _patch_discord(monkeypatch, iter([204]))
+
+    # Act
+    main(["--once"])
+
+    # Assert
+    err = capsys.readouterr().err
+    by_msg = {record["msg"]: record for record in _records(err)}
+    assert by_msg["earnings filing found"]["accession_no"] == "0001-26-000001"
+    assert by_msg["poll cycle finished"]["earnings"] == 1
+    assert by_msg["discord post sent"]["webhook"] == 1
+    assert "secret-token" not in err
+    assert "discord.example" not in err
