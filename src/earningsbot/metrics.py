@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from edgar.earnings import EarningsRelease
+from edgar.earnings import EarningsRelease, Scale
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -20,6 +20,8 @@ _QUARTER_MARK = "three months"
 _MILLION = 1_000_000
 _BILLION = 1_000_000_000
 _TRILLION = 1_000_000_000_000
+# 🔢 A value of 1,000 in the next unit up, so 1000.0M is shown as $1.00B instead.
+_UNIT_LIMIT = 1_000
 
 
 @dataclass(frozen=True)
@@ -48,7 +50,7 @@ def extract_metrics(key_metrics: Mapping[str, object]) -> Metrics:
         return Metrics()
     eps, basis = _eps(key_metrics)
     return Metrics(
-        revenue=_revenue(key_metrics.get("revenue")),
+        revenue=_revenue(key_metrics),
         eps=eps,
         eps_basis=basis,
     )
@@ -69,10 +71,15 @@ def fetch_metrics(
 
 
 def format_revenue(value: float) -> str:
-    """Format dollars with the largest unit that fits, such as $19.6M or $4.20B."""
-    if value < _BILLION:
+    """Format dollars with the largest unit that fits, such as $19.6M or $4.20B.
+
+    The unit is chosen after rounding, so a value that rounds up to 1000 in one
+    unit moves to the next unit instead of showing as "$1000.0M".
+    """
+    # 🔁 Round first, so the unit matches the number that is printed.
+    if round(value / _MILLION, 1) < _UNIT_LIMIT:
         return f"${value / _MILLION:.1f}M"
-    if value < _TRILLION:
+    if round(value / _BILLION, 2) < _UNIT_LIMIT:
         return f"${value / _BILLION:.2f}B"
     return f"${value / _TRILLION:.2f}T"
 
@@ -83,9 +90,13 @@ def format_eps(value: float) -> str:
     return f"{sign}${abs(value):.2f}"
 
 
-def _revenue(value: object) -> float | None:
-    """Return revenue in dollars when it is plausible for one quarter, else None."""
-    number = _finite_number(value)
+def _revenue(key_metrics: Mapping[str, object]) -> float | None:
+    """Return revenue in dollars when its table scale is known and it is plausible."""
+    # 🧮 Without a scale above units, the number may be in thousands or millions.
+    scale = key_metrics.get("scale")
+    if not isinstance(scale, Scale) or scale is Scale.UNITS:
+        return None
+    number = _finite_number(key_metrics.get("revenue"))
     # 🚫 Post Holdings reported 4.2 (unscaled billions), so tiny values are omitted.
     if number is None or number < MIN_REVENUE:
         return None

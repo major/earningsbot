@@ -2,6 +2,7 @@
 
 import functools
 import json
+import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -100,16 +101,24 @@ def test_main_exits_2_without_identity(
 
 
 def test_main_once_sets_identity_and_polls(
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     identities: list[str],
     feed: list[dict[str, object]],
 ) -> None:
-    """With --once, main sets the identity, prints one line, and returns normally."""
+    """With --once, main sets the identity, prints one line, and quiets httpx2."""
+    # Arrange: edgartools sets this level on import, so reset it to prove main sets it.
+    httpx_logger = logging.getLogger("httpx2")
+    monkeypatch.setattr(httpx_logger, "level", logging.NOTSET)
+
+    # Act
     main(["--once"])
 
+    # Assert
     assert identities == ["Test User test@example.com"]
     assert feed == [{"form": "8-K", "page_size": 100}]
     assert capsys.readouterr().out == EXPECTED_LINE
+    assert httpx_logger.level == logging.WARNING
 
 
 @pytest.mark.usefixtures("identities", "feed")
@@ -206,6 +215,63 @@ def test_main_posts_to_discord_when_webhooks_set(
     assert [str(post.url) for post in posts] == ["https://a/x", "https://b/y"]
     assert json.loads(posts[0].content)["embeds"][0]["title"] == "ACME: Acme Corp"
     assert capsys.readouterr().out == EXPECTED_LINE
+
+
+@pytest.mark.parametrize(
+    "webhook",
+    ["not a url", "ftp://h/x", "https://[::1/x", "https://a b/x"],
+)
+@pytest.mark.usefixtures("identities")
+def test_main_exits_2_on_invalid_webhook_url(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    feed: list[dict[str, object]],
+    webhook: str,
+) -> None:
+    """A bad webhook exits 2 before polling, and its URL is never printed."""
+    # Arrange
+    monkeypatch.setenv(WEBHOOKS_ENV, f"https://a/x,{webhook}")
+    posts = _patch_discord(monkeypatch, iter([]))
+
+    # Act
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--once"])
+
+    # Assert
+    err = capsys.readouterr().err
+    assert exc_info.value.code == USAGE_EXIT_CODE
+    assert (
+        err == "error: DISCORD_EARNINGS_WEBHOOKS entry 2 is not a valid http(s) URL\n"
+    )
+    assert feed == []
+    assert posts == []
+
+
+@pytest.mark.usefixtures("identities", "feed")
+def test_main_permanent_webhook_failure_does_not_repeat(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A deleted webhook is warned about once, and the filing is still marked seen."""
+    # Arrange
+    monkeypatch.setenv(WEBHOOKS_ENV, "https://a/x,https://b/y")
+    posts = _patch_discord(monkeypatch, iter([204, 404]))
+
+    # Act
+    main(["--once"])
+    first = capsys.readouterr()
+    main(["--once"])
+    second = capsys.readouterr()
+
+    # Assert
+    assert first.out == EXPECTED_LINE
+    assert (
+        "webhook 2: post webhook: unexpected status 404; skipped for this filing"
+        in first.err
+    )
+    assert [str(post.url) for post in posts] == ["https://a/x", "https://b/y"]
+    assert second.out == ""
+    assert second.err == ""
 
 
 @pytest.mark.usefixtures("identities", "feed")

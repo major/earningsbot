@@ -140,7 +140,9 @@ def test_send_payload_posts_json_to_each_webhook() -> None:
         return httpx2.Response(204)
 
     # Act
-    send_payload(_client(handler), [WEBHOOK_A, WEBHOOK_B], payload)
+    send_payload(
+        _client(handler), [WEBHOOK_A, WEBHOOK_B], payload, warn=lambda _m: None
+    )
 
     # Assert
     assert [str(post.url) for post in posts] == [WEBHOOK_A, WEBHOOK_B]
@@ -149,9 +151,10 @@ def test_send_payload_posts_json_to_each_webhook() -> None:
 
 
 def test_send_payload_collects_errors_without_leaking_urls() -> None:
-    """Every webhook is tried, failures are listed in order, and no URL leaks."""
+    """Every webhook is tried, retryable errors raise in order, and no URL leaks."""
     # Arrange
     posts: list[httpx2.Request] = []
+    messages: list[str] = []
     webhooks = [
         "https://server-error.example/hook/status-token",
         "https://down.example/hook/connect-token",
@@ -175,26 +178,34 @@ def test_send_payload_collects_errors_without_leaking_urls() -> None:
 
     # Act
     with pytest.raises(RuntimeError) as exc_info:
-        send_payload(_client(handler), webhooks, {"embeds": []})
+        send_payload(_client(handler), webhooks, {"embeds": []}, warn=messages.append)
 
     # Assert
     message = str(exc_info.value)
     assert message == (
-        "post webhook: unexpected status 500; "
-        "post webhook: request failed; "
-        "post webhook: deadline exceeded; "
-        "build webhook request: invalid webhook URL"
+        "webhook 1: post webhook: unexpected status 500; "
+        "webhook 2: post webhook: request failed; "
+        "webhook 3: post webhook: deadline exceeded"
     )
+    assert messages == [
+        (
+            "webhook 4: build webhook request: invalid webhook URL; "
+            "skipped for this filing"
+        ),
+    ]
     assert [post.url.host for post in posts] == ["good.example"]
-    for secret in ("status-token", "connect-token", "timeout-token", "good-token"):
-        assert secret not in message
+    text = " ".join([message, *messages])
+    for secret in ("status-token", "connect-token", "timeout-token", "malformed-token"):
+        assert secret not in text
+    assert "good-token" not in text
 
 
 @pytest.mark.parametrize("webhook", ["not a url", "/relative", "https:///no-host"])
-def test_send_payload_rejects_urls_without_a_host(webhook: str) -> None:
-    """A URL with no scheme or host is invalid, and the next webhook still posts."""
+def test_send_payload_skips_urls_without_a_host(webhook: str) -> None:
+    """A URL with no scheme or host is skipped with a warning, and the next posts."""
     # Arrange
     posts: list[httpx2.Request] = []
+    messages: list[str] = []
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         """🧪 Record each post and accept it."""
@@ -202,12 +213,136 @@ def test_send_payload_rejects_urls_without_a_host(webhook: str) -> None:
         return httpx2.Response(204)
 
     # Act
-    with pytest.raises(RuntimeError) as exc_info:
-        send_payload(_client(handler), [webhook, WEBHOOK_A], {"embeds": []})
+    send_payload(
+        _client(handler), [webhook, WEBHOOK_A], {"embeds": []}, warn=messages.append
+    )
 
     # Assert
-    assert str(exc_info.value) == "build webhook request: invalid webhook URL"
+    assert messages == [
+        (
+            "webhook 1: build webhook request: invalid webhook URL; "
+            "skipped for this filing"
+        ),
+    ]
     assert [str(post.url) for post in posts] == [WEBHOOK_A]
+
+
+@pytest.mark.parametrize("status", [301, 400, 401, 403, 404])
+def test_send_payload_skips_permanent_failures_with_a_warning(status: int) -> None:
+    """A permanent 4xx warns once and skips only that webhook. Later ones still post."""
+    # Arrange
+    posts: list[httpx2.Request] = []
+    messages: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        """🧪 Reject the bad webhook with the given status, and accept the rest."""
+        if request.url.host == "bad.example":
+            return httpx2.Response(status)
+        posts.append(request)
+        return httpx2.Response(204)
+
+    # Act
+    send_payload(
+        _client(handler),
+        [WEBHOOK_A, "https://bad.example/hook/bad-token", WEBHOOK_B],
+        {"embeds": []},
+        warn=messages.append,
+    )
+
+    # Assert
+    assert messages == [
+        f"webhook 2: post webhook: unexpected status {status}; skipped for this filing",
+    ]
+    assert [str(post.url) for post in posts] == [WEBHOOK_A, WEBHOOK_B]
+    assert "bad-token" not in messages[0]
+
+
+@pytest.mark.parametrize("status", [408, 429, 500])
+def test_send_payload_raises_for_retryable_failures(status: int) -> None:
+    """A timeout, rate limit, or server error raises for a retry, after all posts."""
+    # Arrange
+    posts: list[httpx2.Request] = []
+    messages: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        """🧪 Fail the first webhook with the given status, and accept the second."""
+        if request.url.host == "flaky.example":
+            return httpx2.Response(status)
+        posts.append(request)
+        return httpx2.Response(204)
+
+    # Act
+    with pytest.raises(RuntimeError) as exc_info:
+        send_payload(
+            _client(handler),
+            ["https://flaky.example/hook/flaky-token", WEBHOOK_B],
+            {"embeds": []},
+            warn=messages.append,
+        )
+
+    # Assert
+    assert str(exc_info.value) == f"webhook 1: post webhook: unexpected status {status}"
+    assert "flaky-token" not in str(exc_info.value)
+    assert messages == []
+    assert [str(post.url) for post in posts] == [WEBHOOK_B]
+
+
+@pytest.mark.parametrize("stage", ["build", "send"])
+def test_send_payload_names_unexpected_errors_by_type_only(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    """An unexpected build or send error is retryable and shows only its type."""
+    # Arrange
+    posts: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        """🧪 Fail the odd webhook when sending, with a message that echoes its URL."""
+        if request.url.host == "odd.example":
+            msg = f"failed at {request.url}"
+            raise ValueError(msg)
+        posts.append(request)
+        return httpx2.Response(204)
+
+    client = _client(handler)
+    if stage == "build":
+        build_request = client.build_request
+
+        def failing_build(
+            method: str,
+            url: str,
+            *,
+            content: str,
+            headers: dict[str, str],
+            timeout: float,
+        ) -> httpx2.Request:
+            """🧪 Fail the odd webhook while building its request, echoing its URL."""
+            if "odd.example" in url:
+                msg = f"failed at {url}"
+                raise ValueError(msg)
+            return build_request(
+                method,
+                url,
+                content=content,
+                headers=headers,
+                timeout=timeout,
+            )
+
+        monkeypatch.setattr(client, "build_request", failing_build)
+
+    # Act
+    with pytest.raises(RuntimeError) as exc_info:
+        send_payload(
+            client,
+            ["https://odd.example/hook/odd-token", WEBHOOK_B],
+            {"embeds": []},
+            warn=lambda _m: None,
+        )
+
+    # Assert
+    assert str(exc_info.value) == "webhook 1: post webhook: ValueError"
+    assert "odd-token" not in str(exc_info.value)
+    assert [str(post.url) for post in posts] == [WEBHOOK_B]
 
 
 def _raising_lookup(_cik: int | str) -> str:
@@ -243,6 +378,7 @@ def test_notify_discord_uses_company_when_ticker_lookup_fails(
         webhooks=[WEBHOOK_A],
         stock_logo=STOCK_LOGO,
         transparent_png=TRANSPARENT_PNG,
+        warn=lambda _m: None,
         lookup_ticker=lookup,
         get_metrics=lambda _filing: Metrics(),
     )
@@ -275,6 +411,7 @@ def test_notify_discord_sends_basic_alert_when_metrics_fail() -> None:
         webhooks=[WEBHOOK_A],
         stock_logo=STOCK_LOGO,
         transparent_png=TRANSPARENT_PNG,
+        warn=lambda _m: None,
         lookup_ticker=lambda _cik: "ACME",
         get_metrics=failing_metrics,
     )

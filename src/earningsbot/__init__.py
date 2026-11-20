@@ -1,6 +1,7 @@
 """Earningsbot package entry point."""
 
 import argparse
+import logging
 import os
 import sys
 import time
@@ -40,6 +41,11 @@ def _emit(text: str) -> None:
     sys.stdout.flush()
 
 
+def _warn(message: str) -> None:
+    """Write one warning line to stderr."""
+    sys.stderr.write(message + "\n")
+
+
 def _notify(filing: Filing) -> None:
     """Print one earnings filing as a line on stdout."""
     _emit(format_filing(filing) + "\n")
@@ -62,9 +68,36 @@ def _webhook_urls(raw: str) -> list[str]:
     return [url for url in stripped if url]
 
 
+def _is_http_url(value: str) -> bool:
+    """Return True when the value is an http or https URL with a host and no spaces."""
+    # 🚧 httpx2 accepts spaces and turns them into %20 in the host, so reject them here.
+    if any(char.isspace() for char in value):
+        return False
+    try:
+        url = httpx2.URL(value)
+    except httpx2.InvalidURL:
+        return False
+    return url.scheme in ("http", "https") and bool(url.host)
+
+
+def _require_http_urls(webhooks: list[str]) -> None:
+    """Exit with a usage error when a webhook is not an http(s) URL with a host.
+
+    The URL is never printed, because it carries a secret token. 🔒
+    """
+    # 🧭 Checked before polling, so a typo fails at once instead of on every cycle.
+    for number, webhook in enumerate(webhooks, start=1):
+        if not _is_http_url(webhook):
+            sys.stderr.write(
+                f"error: {WEBHOOKS_ENV} entry {number} is not a valid http(s) URL\n"
+            )
+            raise SystemExit(USAGE_EXIT_CODE)
+
+
 def _discord_notifier(
     client: httpx2.Client,
     webhooks: list[str],
+    warn: Callable[[str], object],
 ) -> Callable[[Filing], None]:
     """Return a notifier that prints each filing, then posts it to Discord."""
     stock_logo = _setting(STOCK_LOGO_ENV, DEFAULT_STOCK_LOGO)
@@ -80,6 +113,7 @@ def _discord_notifier(
             webhooks=webhooks,
             stock_logo=stock_logo,
             transparent_png=transparent_png,
+            warn=warn,
             lookup_ticker=find_ticker,
             # 📊 Passed in like find_ticker, so tests can patch it in this module.
             get_metrics=fetch_metrics,
@@ -112,18 +146,21 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(USAGE_EXIT_CODE)
 
     set_identity(identity)
+    # 🔇 httpx2 logs full request URLs at INFO, and those URLs carry the webhook tokens.
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
     webhooks = _webhook_urls(os.environ.get(WEBHOOKS_ENV, ""))
+    _require_http_urls(webhooks)
     with ExitStack() as stack:
         seen = stack.enter_context(closing(SeenStore(_state_path())))
         notify: Callable[[Filing], None] = _notify
         if webhooks:
             # 🌐 One client serves the whole run, and the stack closes it on any exit.
             client = stack.enter_context(closing(httpx2.Client()))
-            notify = _discord_notifier(client, webhooks)
+            notify = _discord_notifier(client, webhooks, _warn)
         succeeded = poll(
             fetch=lambda: get_current_filings(form="8-K", page_size=100),
             notify=notify,
-            warn=lambda message: sys.stderr.write(message + "\n"),
+            warn=_warn,
             sleep=time.sleep,
             seen=seen,
             interval=args.interval,

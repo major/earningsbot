@@ -4,6 +4,8 @@
 """
 
 import json
+from dataclasses import dataclass
+from http import HTTPStatus
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import httpx2
@@ -20,6 +22,10 @@ _TITLE_LIMIT = 256
 _WEBHOOK_TIMEOUT_SECONDS = 10.0
 _EARNINGS_DESCRIPTION = "📄 Earnings release filed"
 _INVALID_WEBHOOK = "build webhook request: invalid webhook URL"
+# 🔁 Besides 5xx, these 4xx codes mean "try again later", so they are retried.
+_RETRYABLE_STATUSES = frozenset(
+    {HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.TOO_MANY_REQUESTS},
+)
 
 
 class EmbedImage(TypedDict):
@@ -42,6 +48,14 @@ class WebhookPayload(TypedDict):
     """JSON body accepted by a Discord webhook."""
 
     embeds: list[Embed]
+
+
+@dataclass(frozen=True)
+class _PostError:
+    """🧾 One failed post: a safe message, and whether a retry can never help."""
+
+    message: str
+    permanent: bool
 
 
 def earnings_payload(
@@ -75,22 +89,30 @@ def send_payload(
     webhooks: Sequence[str],
     payload: WebhookPayload,
     *,
+    warn: Callable[[str], object],
     timeout: float = _WEBHOOK_TIMEOUT_SECONDS,
 ) -> None:
-    """Post the payload to each webhook in order, then raise once if any post failed.
+    """Post the payload to each webhook, then raise once if a retryable post failed.
 
-    Every webhook is tried, even after one fails. Error text never includes a
-    webhook URL, because the URL carries a secret token. 🔒
+    A permanent failure, such as a deleted webhook, calls ``warn`` and skips only
+    that webhook, so it cannot repost the filing to the others forever. A
+    retryable failure raises, so the filing is retried next cycle. Every webhook
+    is tried, even after one fails. Error text never includes a webhook URL,
+    because the URL carries a secret token. 🔒
     """
     # 🧾 Compact JSON keeps each body small, and raw UTF-8 keeps names readable.
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    errors: list[str] = []
-    for webhook in webhooks:
-        error = _post(client, webhook, body, timeout)
-        if error:
-            errors.append(error)
-    if errors:
-        raise RuntimeError("; ".join(errors))
+    retryable: list[str] = []
+    for number, webhook in enumerate(webhooks, start=1):
+        failure = _post(client, webhook, body, timeout)
+        if failure is None:
+            continue
+        if failure.permanent:
+            warn(f"webhook {number}: {failure.message}; skipped for this filing")
+        else:
+            retryable.append(f"webhook {number}: {failure.message}")
+    if retryable:
+        raise RuntimeError("; ".join(retryable))
 
 
 def notify_discord(  # noqa: PLR0913 - the spec fixes these injected dependencies as keywords
@@ -100,10 +122,11 @@ def notify_discord(  # noqa: PLR0913 - the spec fixes these injected dependencie
     webhooks: Sequence[str],
     stock_logo: str,
     transparent_png: str,
+    warn: Callable[[str], object],
     lookup_ticker: Callable[[int | str], object] = find_ticker,
     get_metrics: Callable[[Filing], Metrics] = fetch_metrics,
 ) -> None:
-    """Post an embed for the filing to each webhook. Failures raise for a retry."""
+    """Post an embed to each webhook. Permanent failures warn, retryable ones raise."""
     ticker = _ticker_or_empty(filing.cik, lookup_ticker)
     metrics = _metrics_or_empty(filing, get_metrics)
     payload = earnings_payload(
@@ -113,7 +136,7 @@ def notify_discord(  # noqa: PLR0913 - the spec fixes these injected dependencie
         transparent_png=transparent_png,
         metrics=metrics,
     )
-    send_payload(client, webhooks, payload)
+    send_payload(client, webhooks, payload, warn=warn)
 
 
 def _description(metrics: Metrics) -> str:
@@ -154,8 +177,26 @@ def _post(
     webhook: str,
     body: str,
     timeout: float,
-) -> str | None:
-    """Post one body to one webhook, returning a sanitized error or None on success."""
+) -> _PostError | None:
+    """Post one body to one webhook, returning a classified error or None on success.
+
+    Any unexpected exception becomes a retryable error that names only its type,
+    so it never carries the URL and never stops the other webhooks. 🛟
+    """
+    try:
+        return _post_request(client, webhook, body, timeout)
+    except Exception as err:  # noqa: BLE001 - never skip webhooks or leak URLs
+        # 🛟 Only the type name is kept, because the error text may echo the URL.
+        return _PostError(f"post webhook: {type(err).__name__}", permanent=False)
+
+
+def _post_request(
+    client: httpx2.Client,
+    webhook: str,
+    body: str,
+    timeout: float,
+) -> _PostError | None:
+    """Build and send one request, classifying the failures it knows about."""
     try:
         request = client.build_request(
             "POST",
@@ -165,20 +206,28 @@ def _post(
             timeout=timeout,
         )
     except httpx2.InvalidURL:
-        # 🧱 A malformed URL must not stop the loop, so it becomes one error entry.
-        return _INVALID_WEBHOOK
+        # 🧱 A malformed URL must not stop the loop, so it becomes one permanent error.
+        request = None
     # 🧱 A URL without a scheme or host builds fine, but cannot be posted to.
-    if not request.url.is_absolute_url or not request.url.host:
-        return _INVALID_WEBHOOK
+    if request is None or not request.url.is_absolute_url or not request.url.host:
+        return _PostError(_INVALID_WEBHOOK, permanent=True)
     try:
         response = client.send(request)
     except httpx2.TimeoutException:
-        return "post webhook: deadline exceeded"
+        return _PostError("post webhook: deadline exceeded", permanent=False)
     except httpx2.RequestError:
-        return "post webhook: request failed"
-    if not response.is_success:
-        return f"post webhook: unexpected status {response.status_code}"
-    return None
+        return _PostError("post webhook: request failed", permanent=False)
+    if response.is_success:
+        return None
+    status = response.status_code
+    # 🧭 Only 408, 429, and 5xx may pass later. Every other status is permanent.
+    retryable = (
+        status in _RETRYABLE_STATUSES or status >= HTTPStatus.INTERNAL_SERVER_ERROR
+    )
+    return _PostError(
+        f"post webhook: unexpected status {status}",
+        permanent=not retryable,
+    )
 
 
 def _limit_embed_text(value: str, limit: int) -> str:

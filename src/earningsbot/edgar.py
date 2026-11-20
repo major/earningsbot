@@ -71,7 +71,10 @@ def new_earnings_filings(
     """Yield unseen filings that report Item 2.02, in feed order.
 
     Every unseen filing gets one items lookup. Lookup errors propagate to the
-    caller, and filings yielded before the error stay yielded. A non-earnings
+    caller, and filings yielded before the error stay yielded. A failure ends
+    the cycle, so filings after the failing one wait for the next cycle. The SEC
+    feed is newest first, so older filings stuck behind a filing that keeps
+    failing can scroll off the page and be missed. A non-earnings
     filing joins ``seen`` right away. An earnings filing joins ``seen`` only
     after the caller asks for the next item, so a failed write is retried on
     the next poll.
@@ -110,7 +113,10 @@ def poll(  # noqa: PLR0913 - the spec fixes these injected dependencies as keywo
 
     ``notify`` gets each new earnings filing once. The caller owns ``seen``, so
     a filing already recorded there, even by an earlier run, is not notified
-    again. A failed cycle calls ``warn`` and polling continues. Returns True
+    again. A failed cycle calls ``warn`` and polling continues. A failure ends
+    the cycle, so filings after the failing one wait for the next cycle. The SEC
+    feed is newest first, so older filings stuck behind a filing that keeps
+    failing can scroll off the page and be missed. Returns True
     when the single cycle in ``once`` mode succeeded, and False when it warned.
     The loop never returns otherwise. Dependencies are injected so tests need
     no network and no real sleeping.

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import pytest
+from edgar.earnings import Scale
 
 from earningsbot.metrics import (
     Metrics,
@@ -29,6 +30,7 @@ def _key_metrics(**values: object) -> dict[str, object]:
         "eps_basic": None,
         "eps_diluted": None,
         "period": QUARTER,
+        "scale": None,
     }
     return base | values
 
@@ -53,6 +55,7 @@ class FakeRelease:
                 eps_basic=-1.06,
                 eps_diluted=-1.06,
                 period="Three Months Ended - September 30, 2026",
+                scale=Scale.THOUSANDS,
             ),
             Metrics(revenue=19_589_000.0, eps=-1.06, eps_basis="diluted"),
             id="geospace-diluted",
@@ -62,17 +65,26 @@ class FakeRelease:
                 revenue=44_848_000.0,
                 eps_basic=-0.11,
                 period="Three Months\n\n\nEnded September\n\n\n30, 2026",
+                scale=Scale.THOUSANDS,
             ),
             Metrics(revenue=44_848_000.0, eps=-0.11, eps_basis="basic"),
             id="hyperscale-basic-only",
         ),
         pytest.param(
-            _key_metrics(revenue=4.2, period="Three Months Ended September 30, - 2026"),
+            _key_metrics(
+                revenue=4.2,
+                period="Three Months Ended September 30, - 2026",
+                scale=Scale.MILLIONS,
+            ),
             Metrics(),
             id="post-unscaled-revenue",
         ),
         pytest.param(
-            _key_metrics(net_income=7_300_000.0, period="U.S. CLO Debt"),
+            _key_metrics(
+                net_income=7_300_000.0,
+                period="U.S. CLO Debt",
+                scale=Scale.THOUSANDS,
+            ),
             Metrics(),
             id="ellington-wrong-table",
         ),
@@ -99,6 +111,21 @@ class FakeRelease:
             id="nan-diluted-falls-back-to-basic",
         ),
         pytest.param(_key_metrics(eps_diluted=1500.0), Metrics(), id="eps-too-large"),
+        pytest.param(
+            _key_metrics(revenue=19_589_000.0, eps_diluted=-1.06, scale=Scale.UNITS),
+            Metrics(eps=-1.06, eps_basis="diluted"),
+            id="units-scale-omits-revenue",
+        ),
+        pytest.param(
+            _key_metrics(revenue=19_589_000.0, eps_diluted=-1.06),
+            Metrics(eps=-1.06, eps_basis="diluted"),
+            id="undetected-scale-omits-revenue",
+        ),
+        pytest.param(
+            _key_metrics(revenue=19_589_000.0, scale="THOUSANDS"),
+            Metrics(),
+            id="non-enum-scale-omits-revenue",
+        ),
     ],
 )
 def test_extract_metrics(key_metrics: dict[str, object], expected: Metrics) -> None:
@@ -116,6 +143,8 @@ def test_extract_metrics(key_metrics: dict[str, object], expected: Metrics) -> N
         (19_589_000, "$19.6M"),
         (4_200_000_000, "$4.20B"),
         (1.5e12, "$1.50T"),
+        (999_950_000, "$1.00B"),
+        (999_995_000_000, "$1.00T"),
     ],
 )
 def test_format_revenue(value: float, expected: str) -> None:
@@ -148,7 +177,13 @@ def test_format_eps(value: float, expected: str) -> None:
     [
         pytest.param(None, Metrics(), id="no-earnings-exhibit"),
         pytest.param(
-            FakeRelease(_key_metrics(revenue=19_589_000.0, eps_diluted=-1.06)),
+            FakeRelease(
+                _key_metrics(
+                    revenue=19_589_000.0,
+                    eps_diluted=-1.06,
+                    scale=Scale.THOUSANDS,
+                ),
+            ),
             Metrics(revenue=19_589_000.0, eps=-1.06, eps_basis="diluted"),
             id="release-with-metrics",
         ),
