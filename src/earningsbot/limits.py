@@ -27,8 +27,9 @@ def time_limit(seconds: float) -> Generator[None]:
     """Raise TimeoutError when the block runs longer than ``seconds`` of wall-clock time.
 
     Uses SIGALRM, so only the main thread can set it. In any other thread the block
-    runs with no limit instead of crashing. The old handler and timer are restored on
-    exit, even when the block raises.
+    runs with no limit instead of crashing. On exit the timer is set to zero and the
+    previous SIGALRM handler is restored, even when the block raises. Time limits
+    never nest, so the previous handler is never a live limit.
     """
     if threading.current_thread() is not threading.main_thread():
         # 🧵 signal.signal raises ValueError outside the main thread, so skip the limit.
@@ -40,15 +41,17 @@ def time_limit(seconds: float) -> Generator[None]:
         raise _Alarm
 
     previous = signal.signal(signal.SIGALRM, on_alarm)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
-        yield
+        try:
+            signal.setitimer(signal.ITIMER_REAL, seconds)
+            yield
+        finally:
+            # ⏲️ A late alarm raises here, inside the outer try, so it is still converted.
+            signal.setitimer(signal.ITIMER_REAL, 0)
     except _Alarm:
         # 🔁 Convert at this boundary only, so callers see a plain TimeoutError.
         msg = f"still running after {seconds} seconds"
         raise TimeoutError(msg) from None
     finally:
-        # ⏲️ Stop the timer before restoring the handler, so a late alarm cannot reach the old one.
-        signal.setitimer(signal.ITIMER_REAL, 0)
         # 🧩 getsignal returns None for a handler set outside Python, and SIG_DFL is the closest restore.
         signal.signal(signal.SIGALRM, signal.SIG_DFL if previous is None else previous)

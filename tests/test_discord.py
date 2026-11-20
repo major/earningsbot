@@ -1,6 +1,7 @@
 """Tests for Discord embed payloads and webhook delivery."""
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -453,6 +454,40 @@ def test_notify_discord_sends_basic_alert_when_metrics_fail(caplog: pytest.LogCa
     assert [(record["msg"], record["accession_no"], record["error"]) for record in _warnings(caplog)] == [
         ("metrics lookup failed", ACCESSION_NO, "RuntimeError"),
     ]
+
+
+def test_notify_discord_logs_metrics_duration_after_a_successful_lookup(caplog: pytest.LogCaptureFixture) -> None:
+    """A successful metrics lookup logs one INFO line with its accession number and duration in milliseconds."""
+    # Arrange
+    caplog.set_level(logging.INFO)
+    posts: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        """🧪 Record each post and accept it."""
+        posts.append(request)
+        return httpx2.Response(204)
+
+    def metrics(_filing: object) -> Metrics:
+        """🧪 Return numbers at once, so the duration is short and known to be an int."""
+        return Metrics(eps=1.5, eps_basis="GAAP")
+
+    # Act
+    notify_discord(
+        FakeFiling(),
+        client=_client(handler),
+        webhooks=[WEBHOOK_A],
+        stock_logo=STOCK_LOGO,
+        transparent_png=TRANSPARENT_PNG,
+        lookup_ticker=lambda _cik: "ACME",
+        get_metrics=metrics,
+    )
+
+    # Assert
+    records = [json.loads(JsonFormatter().format(record)) for record in caplog.records]
+    finished = [record for record in records if record["msg"] == "metrics lookup finished"]
+    assert len(finished) == 1
+    assert finished[0]["accession_no"] == ACCESSION_NO
+    assert isinstance(finished[0]["duration_ms"], int)
 
 
 def test_notify_discord_posts_basic_alert_when_metrics_time_out(

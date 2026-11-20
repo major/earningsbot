@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx2
-from edgar import get_current_filings, set_identity
+from edgar import get_current_filings, httpclient, set_identity
 from edgar.reference.tickers import find_ticker
 
 from earningsbot.discord import notify_discord
@@ -37,6 +37,20 @@ DEFAULT_STATE_PATH = ".earningsbot/seen.sqlite3"
 DEFAULT_STOCK_LOGO = "https://static.stocktitan.net/company-logo/%s.webp"
 DEFAULT_TRANSPARENT_PNG = "https://major.io/transparent.png"
 USAGE_EXIT_CODE = 2
+
+
+def disable_edgar_http_cache() -> None:
+    """Turn off edgartools' HTTP cache for this process. Call it before any download.
+
+    🧊 edgartools caches /Archives forever. A download cut off by our time limit can
+    leave an empty body in that cache, and every later try would read it back. The
+    seen store already removes duplicates, so the cache adds nothing here.
+    """
+    # 🔁 The rate limit comes from the same env setting edgartools uses at import.
+    httpclient.HTTP_MGR = httpclient.get_http_mgr(
+        cache_enabled=False,
+        request_per_sec_limit=httpclient.get_edgar_rate_limit_per_sec(),
+    )
 
 
 def _emit(text: str) -> None:
@@ -150,6 +164,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(USAGE_EXIT_CODE)
 
     set_identity(identity)
+    disable_edgar_http_cache()
     # 🧾 Checked before any polling, so a bad level never starts a run.
     level = _log_level()
     configure_logging(level)
